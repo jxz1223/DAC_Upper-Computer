@@ -1,0 +1,28 @@
+# Runtime noise
+*.log
+*.tmp
+*.temp
+*.bak
+*.old
+*.orig
+*.swp
+*~
+
+# Python caches, if the bundled app writes any beside the executable
+__pycache__/
+*.py[cod]
+
+# Crash/debug dumps
+*.dmp
+*.dump
+*.pdb
+
+# Local editor and OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Do not ignore PyInstaller runtime dependencies in this dist folder.
+!DAC_Wireless_Scan_GUI.exe
+!_internal/
