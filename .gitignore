@@ -1,0 +1,29 @@
+# Python/cache noise
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local build environment and generated output
+.build-venv/
+build/
+dist/
+*.spec.tmp
+
+# Keep only the release executable used by the launcher.
+*.exe
+!SensorWaveformViewer_AC_DC_v2.exe
+
+# Runtime/output noise
+*.log
+*.tmp
+*.bak
+*.old
+*.swp
+*~
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
