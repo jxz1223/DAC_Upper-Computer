@@ -3,6 +3,7 @@ import struct
 import sys
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -28,6 +29,93 @@ DC_EVT_SCAN_BEGIN = 0x90
 DC_EVT_SCAN_POINTS = 0x91
 DC_EVT_SCAN_END = 0x92
 DC_EVT_SENSOR_READINGS = 0x93
+
+MULTI_VERSION = 2
+MULTI_MAX_PAYLOAD = 232
+MULTI_NODE_RELAY = 0x0000
+MULTI_NODE_BROADCAST = 0xFFFF
+MULTI_CMD_SCAN_START = 0x10
+MULTI_CMD_SET_DAC = 0x11
+MULTI_CMD_ABORT = 0x12
+MULTI_SET_DAC_FLAG_SAVE = 0x04
+MULTI_EVT_ACK = 0x80
+MULTI_EVT_NACK = 0x81
+MULTI_EVT_SCAN_BEGIN = 0x90
+MULTI_EVT_SCAN_POINTS = 0x91
+MULTI_EVT_SCAN_END = 0x92
+MULTI_EVT_SENSOR_READINGS = 0x93
+MULTI_EVT_RAW_SAMPLES = 0xA0
+MULTI_EVT_LINK_STATUS = 0xA1
+MULTI_EVT_RELAY_STATS = 0xA2
+MULTI_EVT_COMMAND_TRACE = 0xA3
+MULTI_NODE_COLORS = ("#22d3ee", "#f472b6", "#a3e635", "#fb923c")
+MULTI_GATT_STAGE_NAMES = {
+    0: "无",
+    1: "ATT MTU 协商",
+    2: "主服务发现",
+    3: "特征发现",
+    4: "通知描述符发现",
+    5: "使能通知",
+    6: "GATT 已就绪",
+}
+MULTI_HCI_REASON_NAMES = {
+    0x05: "认证失败",
+    0x08: "连接监控超时",
+    0x13: "远端设备主动终止",
+    0x14: "远端资源不足",
+    0x15: "远端设备关机",
+    0x16: "本地主机主动终止",
+    0x22: "链路层响应超时",
+    0x3B: "连接参数不可接受",
+    0x3E: "连接建立失败",
+}
+MULTI_GATT_ERROR_NAMES = {
+    0x0A: "属性未找到",
+    0x64: "协议栈资源暂时不足",
+    0x91: "BLE 操作失败",
+    0x92: "GATT 参数无效",
+    0x93: "HCI/GATT 命令忙",
+    0xE1: "未找到目标主服务",
+    0xE2: "未找到收发特征",
+    0xE3: "未找到通知 CCCD",
+    0xE4: "GATT 发现阶段超时",
+    0xE5: "DAC 扫描业务超时",
+    0xE6: "协商后的 ATT MTU 无法承载扫描帧",
+    0xFF: "HCI 命令响应超时",
+}
+MULTI_COMMAND_NAMES = {
+    MULTI_CMD_SCAN_START: "开始 DAC 扫描",
+    MULTI_CMD_SET_DAC: "设置 DAC",
+    MULTI_CMD_ABORT: "终止 DAC 扫描",
+}
+MULTI_COMMAND_TRACE_NAMES = {
+    0x00: "中继 UART 已收到并校验完整命令帧",
+    0x01: "中继已解析串口命令并加入 BLE 队列",
+    0x02: "中继 BLE 写入接口已接受命令",
+    0x03: "中继已收到传感器事件",
+    0x04: "中继已收到传感器 ACK",
+    0x05: "中继已收到传感器 NACK",
+    0x06: "中继收到的传感器帧无效",
+    0x07: "中继正在重发命令",
+    0x08: "中继等待传感器确认超时",
+    0x09: "中继 BLE 写入失败",
+}
+MULTI_STATUS_NAMES = {
+    0x00: "成功",
+    0x01: "CRC 校验失败",
+    0x02: "协议版本错误",
+    0x03: "帧长度或参数错误",
+    0x04: "未知命令",
+    0x05: "没有可用链路",
+    0x06: "设备忙",
+    0x07: "不支持",
+    0x08: "接收缓冲区溢出",
+    0x09: "命令确认超时",
+    0x0A: "队列已满",
+    0x0B: "未找到目标节点",
+    0x0C: "目标链路尚未就绪",
+    0x0D: "中继到传感器的 BLE 写入失败",
+}
 
 
 def dc_crc16(data):
@@ -89,6 +177,97 @@ class DcFrameParser:
         return frames
 
 
+@dataclass(frozen=True)
+class MultiFrame:
+    kind: int
+    flags: int
+    node_id: int
+    scan_id: int
+    seq: int
+    payload: bytes
+
+
+def multi_encode(frame_type, node_id, flags=0, scan_id=1, seq=1, payload=b""):
+    if not 0 <= node_id <= 0xFFFF:
+        raise ValueError("NodeId 超出 uint16 范围")
+    if len(payload) > MULTI_MAX_PAYLOAD:
+        raise ValueError(f"一对多协议负载不能超过 {MULTI_MAX_PAYLOAD} 字节")
+    header = struct.pack(
+        "<BBBHHHB", MULTI_VERSION, frame_type, flags, node_id, scan_id, seq, len(payload)
+    )
+    return DC_MAGIC + header + payload + struct.pack("<H", dc_crc16(header + payload))
+
+
+class MultiFrameParser:
+    """Parser for the relay V2 protocol carrying an explicit uint16 NodeId."""
+
+    def __init__(self):
+        self.buffer = bytearray()
+        self.valid_frames = 0
+        self.discarded_bytes = 0
+
+    def clear(self):
+        self.buffer.clear()
+        self.valid_frames = 0
+        self.discarded_bytes = 0
+
+    def feed(self, chunk):
+        self.buffer.extend(chunk)
+        frames = []
+        while True:
+            pos = self.buffer.find(DC_MAGIC)
+            if pos < 0:
+                keep = 1 if self.buffer and self.buffer[-1] == DC_MAGIC[0] else 0
+                self.discarded_bytes += len(self.buffer) - keep
+                self.buffer[:] = self.buffer[-keep:] if keep else b""
+                break
+            if pos:
+                del self.buffer[:pos]
+                self.discarded_bytes += pos
+            if len(self.buffer) < 14:
+                break
+            version, kind, flags, node_id, scan_id, seq, size = struct.unpack_from(
+                "<BBBHHHB", self.buffer, 2
+            )
+            if size > MULTI_MAX_PAYLOAD:
+                del self.buffer[0]
+                self.discarded_bytes += 1
+                continue
+            total = 14 + size
+            if len(self.buffer) < total:
+                break
+            payload = bytes(self.buffer[12:12 + size])
+            received = struct.unpack_from("<H", self.buffer, 12 + size)[0]
+            calculated = dc_crc16(bytes(self.buffer[2:12 + size]))
+            del self.buffer[:total]
+            if version == MULTI_VERSION and received == calculated:
+                frames.append(MultiFrame(kind, flags, node_id, scan_id, seq, payload))
+                self.valid_frames += 1
+            else:
+                self.discarded_bytes += total
+        return frames
+
+
+@dataclass
+class MultiNodeData:
+    node_id: int
+    color_index: int
+    online: bool = False
+    link_state: int = 0
+    link_stage: int = 0
+    hci_reason: int = 0
+    gatt_error: int = 0
+    att_mtu: int = 23
+    address: str = "--"
+    frames: int = 0
+    last_seen: float = 0.0
+    rows: deque = field(default_factory=deque)
+    scan_points: list = field(default_factory=list)
+    scan_expected: int = 0
+    scan_state: str = "idle"
+    scan_id: int = 0
+
+
 class FrameParser:
     """Robust parser for arbitrary serial chunks with automatic resynchronization."""
 
@@ -132,6 +311,7 @@ class FrameParser:
 
 class SerialWorker(QtCore.QObject):
     bytes_received = QtCore.pyqtSignal(bytes)
+    bytes_written = QtCore.pyqtSignal(int)
     state_changed = QtCore.pyqtSignal(bool, str)
     error = QtCore.pyqtSignal(str)
 
@@ -191,7 +371,8 @@ class SerialWorker(QtCore.QObject):
             self.error.emit("串口未连接。")
             return
         try:
-            self.port.write(data)
+            written = self.port.write(data)
+            self.bytes_written.emit(int(written or 0))
         except Exception as exc:
             self.error.emit(f"串口写入失败：{exc}")
 
@@ -229,6 +410,232 @@ class SelectionViewBox(pg.ViewBox):
         super().mouseDragEvent(event, axis=axis)
 
 
+@dataclass(frozen=True)
+class DebugLogEntry:
+    timestamp: str
+    level: str
+    category: str
+    node: str
+    message: str
+    node_color: str = ""
+
+
+class DebugLogWindow(QtWidgets.QDialog):
+    MAX_ENTRIES = 5000
+    LEVEL_COLORS = {
+        "信息": "#334155",
+        "确认": "#15803d",
+        "进度": "#0369a1",
+        "连接": "#15803d",
+        "发现": "#b45309",
+        "设备": "#0369a1",
+        "警告": "#b45309",
+        "错误": "#b91c1c",
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("蓝牙调试日志")
+        self.resize(980, 620)
+        self.setMinimumSize(760, 460)
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose, False)
+        self.entries = deque(maxlen=self.MAX_ENTRIES)
+        self.build_ui()
+
+    def build_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        banner = QtWidgets.QFrame()
+        banner.setObjectName("logBanner")
+        banner_layout = QtWidgets.QHBoxLayout(banner)
+        banner_layout.setContentsMargins(14, 9, 14, 9)
+        title = QtWidgets.QLabel("蓝牙事件终端")
+        title.setObjectName("logTitle")
+        detail = QtWidgets.QLabel("串口 → 中继 → GATT → 传感器")
+        detail.setObjectName("logDetail")
+        self.log_count_label = QtWidgets.QLabel("0 条")
+        self.log_count_label.setObjectName("logCount")
+        banner_layout.addWidget(title)
+        banner_layout.addSpacing(12)
+        banner_layout.addWidget(detail)
+        banner_layout.addStretch(1)
+        banner_layout.addWidget(self.log_count_label)
+        layout.addWidget(banner)
+
+        toolbar = QtWidgets.QHBoxLayout()
+        toolbar.addWidget(QtWidgets.QLabel("显示："))
+        self.filter_combo = QtWidgets.QComboBox()
+        self.filter_combo.addItem("全部事件", "all")
+        self.filter_combo.addItem("连接事件", "link")
+        self.filter_combo.addItem("协议事件", "protocol")
+        self.filter_combo.addItem("设备诊断", "device")
+        self.filter_combo.addItem("警告与错误", "problem")
+        self.filter_combo.currentIndexChanged.connect(self.rebuild_table)
+        toolbar.addWidget(self.filter_combo)
+        self.auto_scroll = QtWidgets.QCheckBox("自动滚动")
+        self.auto_scroll.setChecked(True)
+        toolbar.addWidget(self.auto_scroll)
+        toolbar.addStretch(1)
+        self.pause_button = QtWidgets.QPushButton("暂停刷新")
+        self.pause_button.setCheckable(True)
+        self.pause_button.toggled.connect(self.on_pause_changed)
+        copy_button = QtWidgets.QPushButton("复制可见日志")
+        copy_button.clicked.connect(self.copy_visible)
+        save_button = QtWidgets.QPushButton("保存日志")
+        save_button.clicked.connect(self.save_log)
+        clear_button = QtWidgets.QPushButton("清空")
+        clear_button.clicked.connect(self.clear_log)
+        for widget in (self.pause_button, copy_button, save_button, clear_button):
+            toolbar.addWidget(widget)
+        layout.addLayout(toolbar)
+
+        self.table = QtWidgets.QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["时间", "级别", "节点", "事件"])
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.Fixed)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Fixed)
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.Fixed)
+        header.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+        self.table.setColumnWidth(0, 112)
+        self.table.setColumnWidth(1, 66)
+        self.table.setColumnWidth(2, 142)
+        layout.addWidget(self.table, 1)
+
+        self.empty_label = QtWidgets.QLabel("等待事件。连接数据中继后，蓝牙状态变化会显示在这里。")
+        self.empty_label.setObjectName("logEmpty")
+        self.empty_label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(self.empty_label)
+
+        self.setStyleSheet("""
+            QDialog { background:#f8fafc; color:#172033; font-size:13px; }
+            QLabel { background:transparent; }
+            QFrame#logBanner { background:#172554; border:1px solid #1d4ed8; border-radius:8px; }
+            QLabel#logTitle { color:white; font-size:16px; font-weight:700; }
+            QLabel#logDetail { color:#bfdbfe; }
+            QLabel#logCount { color:#dcfce7; background:#166534; border-radius:10px;
+                              padding:4px 10px; font-weight:700; }
+            QLabel#logEmpty { color:#64748b; padding:8px; }
+            QPushButton { background:#e2e8f0; border:1px solid #b6c2d2; border-radius:5px;
+                          padding:6px 12px; }
+            QPushButton:hover { background:#cbd5e1; }
+            QPushButton:checked { background:#b45309; color:white; border-color:#92400e; }
+            QComboBox { background:white; border:1px solid #b6c2d2; border-radius:4px;
+                        padding:4px; min-height:22px; }
+            QTableWidget { background:#ffffff; alternate-background-color:#f1f5f9;
+                           border:1px solid #cbd5e1; gridline-color:#e2e8f0; }
+            QHeaderView::section { background:#e2e8f0; color:#334155; border:0;
+                                   border-right:1px solid #cbd5e1; padding:6px; font-weight:600; }
+        """)
+
+    def append_event(self, level, category, node, message, node_color=""):
+        entry = DebugLogEntry(
+            datetime.now().strftime("%H:%M:%S.%f")[:-3],
+            level,
+            category,
+            node,
+            message,
+            node_color,
+        )
+        self.entries.append(entry)
+        self.log_count_label.setText(f"{len(self.entries):,} 条")
+        if not self.pause_button.isChecked() and self.matches_filter(entry):
+            if self.table.rowCount() >= self.MAX_ENTRIES:
+                self.table.removeRow(0)
+            self.append_row(entry)
+        self.update_empty_state()
+
+    def matches_filter(self, entry):
+        selected = self.filter_combo.currentData()
+        if selected == "all":
+            return True
+        if selected == "problem":
+            return entry.level in ("警告", "错误")
+        return entry.category == selected
+
+    def append_row(self, entry):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        items = [
+            QtWidgets.QTableWidgetItem(entry.timestamp),
+            QtWidgets.QTableWidgetItem(entry.level),
+            QtWidgets.QTableWidgetItem(entry.node),
+            QtWidgets.QTableWidgetItem(entry.message),
+        ]
+        level_color = QtGui.QColor(self.LEVEL_COLORS.get(entry.level, "#334155"))
+        items[1].setForeground(QtGui.QBrush(level_color))
+        font = items[1].font(); font.setBold(True); items[1].setFont(font)
+        if entry.node_color:
+            items[2].setForeground(QtGui.QBrush(QtGui.QColor(entry.node_color)))
+            node_font = items[2].font(); node_font.setBold(True); items[2].setFont(node_font)
+        if entry.level in ("警告", "错误"):
+            items[3].setForeground(QtGui.QBrush(level_color))
+        for column, item in enumerate(items):
+            self.table.setItem(row, column, item)
+        if self.auto_scroll.isChecked():
+            self.table.scrollToBottom()
+
+    def rebuild_table(self, _index=None):
+        self.table.setRowCount(0)
+        if not self.pause_button.isChecked():
+            for entry in self.entries:
+                if self.matches_filter(entry):
+                    self.append_row(entry)
+        self.update_empty_state()
+
+    def on_pause_changed(self, paused):
+        self.pause_button.setText("继续刷新" if paused else "暂停刷新")
+        if not paused:
+            self.rebuild_table()
+
+    def update_empty_state(self):
+        self.empty_label.setVisible(self.table.rowCount() == 0)
+
+    def visible_text(self):
+        lines = []
+        for row in range(self.table.rowCount()):
+            lines.append("\t".join(
+                self.table.item(row, column).text() for column in range(self.table.columnCount())
+            ))
+        return "\n".join(lines)
+
+    def copy_visible(self):
+        QtWidgets.QApplication.clipboard().setText(self.visible_text())
+
+    def save_log(self):
+        if not self.entries:
+            QtWidgets.QMessageBox.information(self, self.windowTitle(), "当前没有日志可保存。")
+            return
+        default = f"ble_debug_{datetime.now():%Y%m%d_%H%M%S}.csv"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "保存蓝牙调试日志", str(Path.home() / default), "CSV 文件 (*.csv)"
+        )
+        if not path:
+            return
+        with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["time", "level", "category", "node", "event"])
+            for entry in self.entries:
+                writer.writerow([
+                    entry.timestamp, entry.level, entry.category, entry.node, entry.message
+                ])
+
+    def clear_log(self):
+        self.entries.clear()
+        self.table.setRowCount(0)
+        self.log_count_label.setText("0 条")
+        self.update_empty_state()
+
+    def closeEvent(self, event):
+        event.ignore()
+        self.hide()
+
+
 class MainWindow(QtWidgets.QMainWindow):
     request_open = QtCore.pyqtSignal(str, int)
     request_close = QtCore.pyqtSignal()
@@ -242,10 +649,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.parser = FrameParser()
         self.dc_parser = DcFrameParser()
+        self.multi_parser = MultiFrameParser()
         self.dc_rows = deque()
         self.dc_scan_points = []
         self.dc_seq = 1
         self.dc_start_time = None
+        self.multi_nodes = {}
+        self.multi_curves = {}
+        self.multi_seq = 1
+        self.multi_scan_id = 1
+        self.multi_start_time = None
+        self.multi_selected_node_id = None
+        self.multi_relay_stats = None
+        self.multi_paused = False
+        self.multi_plot_dirty = False
+        self.multi_last_stats_values = np.empty(0)
         self.sample_chunks = deque()
         self.sample_count = 0
         self.total_samples = 0
@@ -258,6 +676,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.last_y = np.empty(0)
         self.last_stats_values = np.empty(0)
         self.last_stats_scope = "当前窗口"
+        self.single_link_data_seen = False
+        self.last_logged_mode = None
+        self.debug_log_window = DebugLogWindow(self)
 
         self.worker_thread = QtCore.QThread(self)
         self.worker = SerialWorker()
@@ -266,8 +687,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.request_close.connect(self.worker.close_port)
         self.request_write.connect(self.worker.write)
         self.worker.bytes_received.connect(self.on_bytes)
+        self.worker.bytes_written.connect(self.on_serial_bytes_written)
         self.worker.state_changed.connect(self.on_serial_state)
-        self.worker.error.connect(self.show_error)
+        self.worker.error.connect(self.on_serial_error)
         self.worker_thread.start()
 
         self.build_ui()
@@ -295,7 +717,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sensor_modes.addButton(self.dc_mode)
         mode_row.addWidget(self.ac_mode)
         mode_row.addWidget(self.dc_mode)
+        mode_row.addSpacing(26)
+        mode_row.addWidget(QtWidgets.QLabel("连接方式："))
+        self.single_mode = QtWidgets.QRadioButton("一对一")
+        self.multi_mode = QtWidgets.QRadioButton("一对多")
+        self.single_mode.setChecked(True)
+        self.topology_modes = QtWidgets.QButtonGroup(self)
+        self.topology_modes.setExclusive(True)
+        self.topology_modes.addButton(self.single_mode)
+        self.topology_modes.addButton(self.multi_mode)
+        mode_row.addWidget(self.single_mode)
+        mode_row.addWidget(self.multi_mode)
         mode_row.addStretch(1)
+        self.debug_log_button = QtWidgets.QPushButton("调试日志")
+        self.debug_log_button.setObjectName("debugLogButton")
+        self.debug_log_button.setToolTip("打开蓝牙连接、GATT 发现和协议事件日志")
+        self.debug_log_button.clicked.connect(self.open_debug_log)
+        mode_row.addWidget(self.debug_log_button)
         layout.addLayout(mode_row)
 
         connection_box = QtWidgets.QGroupBox("串口与采样设置")
@@ -350,6 +788,11 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(self.connect_button, 1, 6)
         layout.addWidget(connection_box)
 
+        self.content_stack = QtWidgets.QStackedWidget()
+        single_page = QtWidgets.QWidget()
+        single_layout = QtWidgets.QVBoxLayout(single_page)
+        single_layout.setContentsMargins(0, 0, 0, 0)
+
         self.dc_controls = QtWidgets.QGroupBox("直流传感器 DAC 控制")
         dc_grid = QtWidgets.QGridLayout(self.dc_controls)
         self.dc_min = QtWidgets.QSpinBox(); self.dc_min.setRange(0, 65535); self.dc_min.setValue(0)
@@ -374,7 +817,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dc_grid.addWidget(self.dc_save, 1, 7)
         dc_grid.addWidget(self.dc_export, 0, 8, 2, 1)
         self.dc_controls.hide()
-        layout.addWidget(self.dc_controls)
+        single_layout.addWidget(self.dc_controls)
 
         action_row = QtWidgets.QHBoxLayout()
         self.auto_y = QtWidgets.QCheckBox("自动 Y 轴")
@@ -403,7 +846,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ):
             action_row.addWidget(widget)
         action_row.addStretch(1)
-        layout.addLayout(action_row)
+        single_layout.addLayout(action_row)
 
         measurement_row = QtWidgets.QHBoxLayout()
         conversion = QtWidgets.QGroupBox("传感器测量换算")
@@ -476,7 +919,7 @@ class MainWindow(QtWidgets.QMainWindow):
         stats_layout.setColumnStretch(1, 1)
         measurement_row.addWidget(conversion, 3)
         measurement_row.addWidget(stats, 2)
-        layout.addLayout(measurement_row)
+        single_layout.addLayout(measurement_row)
 
         self.view_box = SelectionViewBox()
         self.plot = pg.PlotWidget(viewBox=self.view_box)
@@ -526,7 +969,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_tabs = QtWidgets.QTabWidget()
         self.plot_tabs.addTab(self.plot, "实时波形")
         self.plot_tabs.addTab(dc_scan_page, "DAC 扫描曲线")
-        layout.addWidget(self.plot_tabs, 1)
+        single_layout.addWidget(self.plot_tabs, 1)
+
+        self.content_stack.addWidget(single_page)
+        self.content_stack.addWidget(self.build_multi_page())
+        layout.addWidget(self.content_stack, 1)
 
         self.status_left = QtWidgets.QLabel("未连接")
         self.status_right = QtWidgets.QLabel("有效帧 0 | 接收 0 B | 丢弃 0 B")
@@ -534,12 +981,188 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().addPermanentWidget(self.status_right)
         self.ac_mode.toggled.connect(self.on_sensor_mode_changed)
         self.dc_mode.toggled.connect(self.on_sensor_mode_changed)
+        self.single_mode.toggled.connect(self.on_topology_mode_changed)
+        self.multi_mode.toggled.connect(self.on_topology_mode_changed)
         self.apply_style()
         self.on_sensor_mode_changed()
+
+    def build_multi_page(self):
+        page = QtWidgets.QWidget()
+        page_layout = QtWidgets.QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 4, 0, 0)
+        page_layout.setSpacing(8)
+
+        banner = QtWidgets.QFrame()
+        banner.setObjectName("multiBanner")
+        banner_layout = QtWidgets.QHBoxLayout(banner)
+        banner_layout.setContentsMargins(14, 8, 14, 8)
+        title = QtWidgets.QLabel("多节点采集台")
+        title.setObjectName("multiTitle")
+        self.multi_banner_detail = QtWidgets.QLabel(
+            "V2 NodeId 路由 · 最多 4 个传感器 · 串口固定建议 921600 baud"
+        )
+        self.multi_banner_detail.setObjectName("multiDetail")
+        banner_layout.addWidget(title)
+        banner_layout.addSpacing(12)
+        banner_layout.addWidget(self.multi_banner_detail)
+        banner_layout.addStretch(1)
+        self.multi_online_badge = QtWidgets.QLabel("0 / 4 在线")
+        self.multi_online_badge.setObjectName("onlineBadge")
+        banner_layout.addWidget(self.multi_online_badge)
+        page_layout.addWidget(banner)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        left_panel = QtWidgets.QWidget()
+        left_panel.setMinimumWidth(320)
+        left_panel.setMaximumWidth(430)
+        left_layout = QtWidgets.QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 4, 0)
+
+        node_box = QtWidgets.QGroupBox("传感器节点机架")
+        node_layout = QtWidgets.QVBoxLayout(node_box)
+        self.multi_node_table = QtWidgets.QTableWidget(0, 5)
+        self.multi_node_table.setHorizontalHeaderLabels(
+            ["通道", "状态", "NodeId", "帧数", "最新值"]
+        )
+        self.multi_node_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.multi_node_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.multi_node_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.multi_node_table.verticalHeader().setVisible(False)
+        self.multi_node_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Fixed)
+        for column, width in enumerate((54, 48, 68, 42, 68)):
+            self.multi_node_table.setColumnWidth(column, width)
+        self.multi_node_table.horizontalHeader().setStretchLastSection(True)
+        self.multi_node_table.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.multi_node_table.setMinimumHeight(155)
+        self.multi_node_table.itemSelectionChanged.connect(self.on_multi_node_selected)
+        node_layout.addWidget(self.multi_node_table)
+        self.multi_target_label = QtWidgets.QLabel("控制目标：尚未发现节点")
+        self.multi_target_label.setObjectName("targetLabel")
+        node_layout.addWidget(self.multi_target_label)
+        self.multi_node_table.setToolTip(
+            "节点按首次发现顺序固定为 CH1–CH4；点击一行选择 DAC/扫描命令目标。"
+        )
+        left_layout.addWidget(node_box)
+
+        actions = QtWidgets.QGroupBox("显示与数据")
+        actions_layout = QtWidgets.QGridLayout(actions)
+        self.multi_show_all = QtWidgets.QCheckBox("叠加全部在线节点")
+        self.multi_show_all.setChecked(True)
+        self.multi_show_all.toggled.connect(self.mark_multi_dirty)
+        self.multi_hold_data = QtWidgets.QCheckBox("保持全部数据")
+        self.multi_auto_y = QtWidgets.QCheckBox("自动 Y 轴")
+        self.multi_auto_y.setChecked(True)
+        self.multi_auto_y.toggled.connect(self.on_multi_auto_y)
+        self.multi_pause_button = QtWidgets.QPushButton("暂停显示")
+        self.multi_pause_button.setCheckable(True)
+        self.multi_pause_button.toggled.connect(self.toggle_multi_pause)
+        self.multi_clear_button = QtWidgets.QPushButton("清空多节点数据")
+        self.multi_clear_button.clicked.connect(self.clear_multi_data)
+        self.multi_save_button = QtWidgets.QPushButton("导出多节点 CSV")
+        self.multi_save_button.clicked.connect(self.save_multi_data)
+        actions_layout.addWidget(self.multi_show_all, 0, 0)
+        actions_layout.addWidget(self.multi_hold_data, 0, 1)
+        actions_layout.addWidget(self.multi_auto_y, 1, 0)
+        actions_layout.addWidget(self.multi_pause_button, 1, 1)
+        actions_layout.addWidget(self.multi_clear_button, 2, 0)
+        actions_layout.addWidget(self.multi_save_button, 2, 1)
+        left_layout.addWidget(actions)
+
+        multi_stats = QtWidgets.QGroupBox("选中节点统计")
+        multi_stats_layout = QtWidgets.QGridLayout(multi_stats)
+        self.multi_value_name = QtWidgets.QLabel("当前字段：ADC")
+        self.multi_latest_label = QtWidgets.QLabel("最新值：--")
+        self.multi_pp_label = QtWidgets.QLabel("峰峰值：--")
+        self.multi_rms_label = QtWidgets.QLabel("有效值：--")
+        self.multi_mean_label = QtWidgets.QLabel("平均值：--")
+        self.multi_range_label = QtWidgets.QLabel("最小/最大：-- / --")
+        self.multi_samples_label = QtWidgets.QLabel("窗口点数：0")
+        multi_stats_layout.addWidget(self.multi_value_name, 0, 0)
+        multi_stats_layout.addWidget(self.multi_samples_label, 0, 1)
+        multi_stats_layout.addWidget(self.multi_latest_label, 1, 0)
+        multi_stats_layout.addWidget(self.multi_pp_label, 1, 1)
+        multi_stats_layout.addWidget(self.multi_rms_label, 2, 0)
+        multi_stats_layout.addWidget(self.multi_mean_label, 2, 1)
+        multi_stats_layout.addWidget(self.multi_range_label, 3, 0, 1, 2)
+        left_layout.addWidget(multi_stats)
+        left_layout.addStretch(1)
+        splitter.addWidget(left_panel)
+
+        right_panel = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(4, 0, 0, 0)
+
+        self.multi_dc_controls = QtWidgets.QGroupBox("选中节点 DAC 控制（V2 定向命令）")
+        multi_dc_grid = QtWidgets.QGridLayout(self.multi_dc_controls)
+        self.multi_dc_min = QtWidgets.QSpinBox(); self.multi_dc_min.setRange(0, 65535)
+        self.multi_dc_max = QtWidgets.QSpinBox(); self.multi_dc_max.setRange(0, 65535); self.multi_dc_max.setValue(65535)
+        self.multi_dc_points = QtWidgets.QSpinBox(); self.multi_dc_points.setRange(2, 255); self.multi_dc_points.setValue(100)
+        self.multi_dc_settle = QtWidgets.QSpinBox(); self.multi_dc_settle.setRange(0, 10000); self.multi_dc_settle.setValue(20); self.multi_dc_settle.setSuffix(" ms")
+        self.multi_dc_average = QtWidgets.QSpinBox(); self.multi_dc_average.setRange(1, 255); self.multi_dc_average.setValue(1)
+        self.multi_dc_value = QtWidgets.QSpinBox(); self.multi_dc_value.setRange(0, 65535); self.multi_dc_value.setValue(32768)
+        multi_dc_fields = [
+            ("起点", self.multi_dc_min), ("终点", self.multi_dc_max),
+            ("点数", self.multi_dc_points), ("等待", self.multi_dc_settle),
+            ("平均次数", self.multi_dc_average), ("DAC 值", self.multi_dc_value),
+        ]
+        for column, (label, widget) in enumerate(multi_dc_fields):
+            multi_dc_grid.addWidget(QtWidgets.QLabel(label), 0, column)
+            multi_dc_grid.addWidget(widget, 1, column)
+        self.multi_dc_start = QtWidgets.QPushButton("开始扫描")
+        self.multi_dc_start.clicked.connect(self.start_multi_dc_scan)
+        self.multi_dc_abort = QtWidgets.QPushButton("终止扫描")
+        self.multi_dc_abort.clicked.connect(self.abort_multi_dc_scan)
+        self.multi_dc_set = QtWidgets.QPushButton("设置 DAC")
+        self.multi_dc_set.clicked.connect(lambda: self.set_multi_dc_dac(False))
+        self.multi_dc_save = QtWidgets.QPushButton("设置并保存")
+        self.multi_dc_save.clicked.connect(lambda: self.set_multi_dc_dac(True))
+        self.multi_dc_export = QtWidgets.QPushButton("导出扫描点")
+        self.multi_dc_export.clicked.connect(self.export_multi_dc_scan)
+        multi_dc_grid.addWidget(self.multi_dc_start, 0, 6)
+        multi_dc_grid.addWidget(self.multi_dc_abort, 1, 6)
+        multi_dc_grid.addWidget(self.multi_dc_set, 0, 7)
+        multi_dc_grid.addWidget(self.multi_dc_save, 1, 7)
+        multi_dc_grid.addWidget(self.multi_dc_export, 0, 8, 2, 1)
+        right_layout.addWidget(self.multi_dc_controls)
+
+        self.multi_plot = pg.PlotWidget()
+        self.multi_plot.setLabel("bottom", "相对采集时间", units="s")
+        self.multi_plot.setLabel("left", "ADC")
+        self.multi_plot.showGrid(x=True, y=True, alpha=0.25)
+        self.multi_plot.addLegend(offset=(12, 12))
+
+        self.multi_scan_plot = pg.PlotWidget()
+        self.multi_scan_plot.setLabel("bottom", "DAC")
+        self.multi_scan_plot.setLabel("left", "Lock-in")
+        self.multi_scan_plot.showGrid(x=True, y=True, alpha=0.25)
+        self.multi_scan_curve = self.multi_scan_plot.plot(
+            [], [], pen=pg.mkPen("#22d3ee", width=1.6), symbol="o", symbolSize=7,
+            symbolBrush=pg.mkBrush("#22d3ee"), symbolPen=pg.mkPen("#e0f2fe"),
+        )
+        multi_scan_page = QtWidgets.QWidget()
+        multi_scan_layout = QtWidgets.QVBoxLayout(multi_scan_page)
+        multi_scan_layout.setContentsMargins(0, 0, 0, 0)
+        self.multi_scan_info = QtWidgets.QLabel("选择节点后可执行 DAC 扫描")
+        self.multi_scan_info.setObjectName("scanInfo")
+        multi_scan_layout.addWidget(self.multi_scan_info)
+        multi_scan_layout.addWidget(self.multi_scan_plot, 1)
+
+        self.multi_plot_tabs = QtWidgets.QTabWidget()
+        self.multi_plot_tabs.addTab(self.multi_plot, "多节点实时波形")
+        self.multi_plot_tabs.addTab(multi_scan_page, "选中节点 DAC 扫描")
+        right_layout.addWidget(self.multi_plot_tabs, 1)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        page_layout.addWidget(splitter, 1)
+        return page
 
     def apply_style(self):
         self.setStyleSheet("""
             QMainWindow, QWidget { background: #f8fafc; color: #172033; font-size: 13px; }
+            QLabel { background: transparent; }
             QGroupBox { font-weight: 600; border: 1px solid #cbd5e1; border-radius: 7px;
                         margin-top: 9px; padding-top: 9px; }
             QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
@@ -547,25 +1170,105 @@ class MainWindow(QtWidgets.QMainWindow):
                           padding: 6px 13px; }
             QPushButton:hover { background: #cbd5e1; }
             QPushButton:checked { background: #2563eb; color: white; border-color: #1d4ed8; }
-            QComboBox, QDoubleSpinBox { background: white; border: 1px solid #b6c2d2;
+            QPushButton#debugLogButton { background: #172554; color: white; border-color: #1d4ed8;
+                                         font-weight: 700; padding: 6px 16px; }
+            QPushButton#debugLogButton:hover { background: #1e3a8a; }
+            QRadioButton { spacing: 6px; font-weight: 600; }
+            QComboBox, QDoubleSpinBox, QSpinBox { background: white; border: 1px solid #b6c2d2;
                                        border-radius: 4px; padding: 4px; min-height: 22px; }
+            QTableWidget { background: white; alternate-background-color: #f1f5f9;
+                           border: 1px solid #cbd5e1; gridline-color: #e2e8f0; }
+            QHeaderView::section { background: #e2e8f0; color: #334155; border: 0;
+                                   border-right: 1px solid #cbd5e1; padding: 5px; font-weight: 600; }
+            QFrame#multiBanner { background: #172554; border: 1px solid #1d4ed8; border-radius: 8px; }
+            QLabel#multiTitle { color: #ffffff; font-size: 16px; font-weight: 700; }
+            QLabel#multiDetail { color: #bfdbfe; }
+            QLabel#onlineBadge { color: #dcfce7; background: #166534; border-radius: 10px;
+                                 padding: 4px 10px; font-weight: 700; }
+            QLabel#targetLabel { color: #1d4ed8; font-weight: 700; padding: 3px; }
+            QLabel#hintLabel { color: #64748b; font-size: 12px; }
+            QLabel#scanInfo { color: #1d4ed8; font-weight: 600; padding: 4px; }
             QStatusBar { background: #e2e8f0; }
         """)
 
+    def open_debug_log(self):
+        self.debug_log_window.show()
+        self.debug_log_window.raise_()
+        self.debug_log_window.activateWindow()
+
+    def log_event(self, level, category, message, node="上位机", node_color=""):
+        self.debug_log_window.append_event(level, category, node, message, node_color)
+
+    def multi_node_log_identity(self, node_id):
+        node = self.multi_nodes.get(node_id)
+        if node is None:
+            return f"0x{node_id:04X}", ""
+        color = MULTI_NODE_COLORS[node.color_index]
+        return f"CH{node.color_index + 1} · 0x{node_id:04X}", color
+
+    @QtCore.pyqtSlot(str)
+    def on_serial_error(self, message):
+        self.log_event("错误", "problem", message, "串口")
+        self.show_error(message)
+
+    @QtCore.pyqtSlot(int)
+    def on_serial_bytes_written(self, count):
+        self.log_event(
+            "串口", "protocol",
+            f"上位机已向系统串口发送缓冲区写入 {count} 字节（不代表中继已接收）",
+            "上位机",
+        )
+
     def on_sensor_mode_changed(self, _checked=False):
+        if not self.ac_mode.isChecked() and not self.dc_mode.isChecked():
+            return
         is_dc = self.dc_mode.isChecked()
         if self.connect_button.isChecked():
             self.connect_button.setChecked(False)
             self.toggle_connection(False)
-        self.dc_controls.setVisible(is_dc)
-        self.data_format.setEnabled(not is_dc)
-        self.sample_rate.setEnabled(not is_dc)
+        is_multi = self.is_multi_mode()
+        self.dc_controls.setVisible(is_dc and not is_multi)
+        self.multi_dc_controls.setVisible(is_dc and is_multi)
+        self.data_format.setEnabled(not is_dc and not is_multi)
+        self.sample_rate.setEnabled(not is_dc and not is_multi)
         self.show_ac_curve.setText("显示去直流波形" if not is_dc else "显示去均值波形")
-        self.baud_combo.setCurrentText("115200" if is_dc else "921600")
+        self.baud_combo.setCurrentText("921600" if is_multi or not is_dc else "115200")
         self.plot_tabs.setTabEnabled(1, is_dc)
         self.plot_tabs.setCurrentIndex(0)
+        self.multi_plot_tabs.setTabEnabled(1, is_dc)
+        self.multi_plot_tabs.setCurrentIndex(0)
+        self.multi_value_name.setText("当前字段：Lock-in" if is_dc else "当前字段：ADC")
+        self.multi_plot.setLabel("left", "Lock-in" if is_dc else "ADC")
+        self.multi_banner_detail.setText(
+            f"V2 NodeId 路由 · 最多 4 个传感器 · 当前显示 {'Lock-in' if is_dc else 'ADC'}"
+        )
         self.clear_data()
-        self.status_left.setText("直流传感器模式" if is_dc else "交流传感器模式")
+        self.clear_multi_data(True)
+        topology = "一对多" if is_multi else "一对一"
+        self.status_left.setText(f"{'直流' if is_dc else '交流'}传感器 · {topology}模式")
+        self.single_link_data_seen = False
+        mode_signature = (is_dc, is_multi)
+        if mode_signature != self.last_logged_mode:
+            self.last_logged_mode = mode_signature
+            self.log_event(
+                "信息", "protocol", f"切换到{'直流' if is_dc else '交流'}传感器 · {topology}模式"
+            )
+
+    def on_topology_mode_changed(self, _checked=False):
+        if not self.single_mode.isChecked() and not self.multi_mode.isChecked():
+            return
+        if self.connect_button.isChecked():
+            self.connect_button.setChecked(False)
+            self.toggle_connection(False)
+        is_multi = self.is_multi_mode()
+        self.content_stack.setCurrentIndex(1 if is_multi else 0)
+        self.baud_combo.setCurrentText(
+            "921600" if is_multi or self.ac_mode.isChecked() else "115200"
+        )
+        self.on_sensor_mode_changed()
+
+    def is_multi_mode(self):
+        return hasattr(self, "multi_mode") and self.multi_mode.isChecked()
 
     @QtCore.pyqtSlot()
     def refresh_ports(self):
@@ -594,8 +1297,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.connect_button.setChecked(False)
                 self.show_error("波特率必须是正整数。")
                 return
+            self.log_event("信息", "link", f"请求打开 {port} @ {baud}", "串口")
             self.request_open.emit(port, baud)
         else:
+            self.log_event("信息", "link", "请求关闭串口", "串口")
             self.request_close.emit()
 
     def detect_baud(self):
@@ -609,6 +1314,7 @@ class MainWindow(QtWidgets.QMainWindow):
         candidates = [921600, 460800, 230400, 115200, 1000000, 2000000, 57600, 38400, 19200, 9600]
         self.detect_baud_button.setEnabled(False)
         self.status_left.setText(f"正在检测 {port} 的波特率...")
+        self.log_event("信息", "protocol", f"开始自动检测 {port} 波特率", "串口")
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         found = None
         try:
@@ -618,7 +1324,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 try:
                     probe = serial.Serial(port, baud, timeout=0.02)
                     probe.reset_input_buffer()
-                    parser = DcFrameParser() if self.dc_mode.isChecked() else FrameParser()
+                    if self.is_multi_mode():
+                        parser = MultiFrameParser()
+                    else:
+                        parser = DcFrameParser() if self.dc_mode.isChecked() else FrameParser()
                     deadline = QtCore.QElapsedTimer()
                     deadline.start()
                     while deadline.elapsed() < 550:
@@ -639,12 +1348,17 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QApplication.restoreOverrideCursor()
             self.detect_baud_button.setEnabled(True)
         if found is None:
-            protocol = "直流协议帧" if self.dc_mode.isChecked() else "合法246字节帧"
+            if self.is_multi_mode():
+                protocol = "V2 多节点协议帧"
+            else:
+                protocol = "直流协议帧" if self.dc_mode.isChecked() else "合法246字节帧"
             self.status_left.setText(f"未检测到{protocol}")
+            self.log_event("警告", "problem", f"未检测到{protocol}", "串口")
             self.show_error("未检测到合法帧。请确认传感器类型选择正确且接收器正在发送数据。")
         else:
             self.baud_combo.setCurrentText(str(found))
             self.status_left.setText(f"检测成功：{port} @ {found}")
+            self.log_event("信息", "protocol", f"波特率检测成功：{port} @ {found}", "串口")
 
     @QtCore.pyqtSlot(bool, str)
     def on_serial_state(self, connected, text):
@@ -654,18 +1368,47 @@ class MainWindow(QtWidgets.QMainWindow):
         self.connect_button.blockSignals(False)
         self.port_combo.setEnabled(not connected)
         self.baud_combo.setEnabled(not connected)
+        self.ac_mode.setEnabled(not connected)
+        self.dc_mode.setEnabled(not connected)
+        self.single_mode.setEnabled(not connected)
+        self.multi_mode.setEnabled(not connected)
+        if not connected and self.is_multi_mode():
+            for node in self.multi_nodes.values():
+                node.online = False
+                node.link_state = 0
+            self.update_multi_node_table()
+            self.multi_plot_dirty = True
+        self.single_link_data_seen = False if not connected else self.single_link_data_seen
         self.status_left.setText(("已连接：" if connected else "") + text)
+        if connected:
+            self.log_event("连接", "link", f"串口已打开：{text}", "串口")
+        else:
+            self.log_event("信息", "link", "串口已关闭；等待重新连接", "串口")
 
     @QtCore.pyqtSlot(bytes)
     def on_bytes(self, chunk):
         self.total_bytes += len(chunk)
+        if self.is_multi_mode():
+            self.on_multi_bytes(chunk)
+            return
         if self.dc_mode.isChecked():
             self.on_dc_bytes(chunk)
             return
+        discarded_before = self.parser.discarded_bytes
         frames = self.parser.feed(chunk)
+        discarded_delta = self.parser.discarded_bytes - discarded_before
+        if discarded_delta:
+            self.log_event(
+                "警告", "problem", f"交流帧同步丢弃 {discarded_delta} 字节", "一对一接收器"
+            )
         if not frames:
             self.update_status()
             return
+        if not self.single_link_data_seen:
+            self.single_link_data_seen = True
+            self.log_event(
+                "连接", "link", "收到首个合法交流数据帧；推断蓝牙数据链路可用", "一对一接收器"
+            )
         dtype = ">u2" if self.data_format.currentIndex() == 0 else ">i2"
         for frame in frames:
             # Sensor payload bytes [3:243]: uint16, MSB first (big-endian).
@@ -682,7 +1425,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.update_status()
 
     def on_dc_bytes(self, chunk):
+        discarded_before = self.dc_parser.discarded_bytes
         frames = self.dc_parser.feed(chunk)
+        discarded_delta = self.dc_parser.discarded_bytes - discarded_before
+        if discarded_delta:
+            self.log_event(
+                "警告", "problem", f"直流 V1 协议丢弃 {discarded_delta} 字节", "一对一接收器"
+            )
+        if frames and not self.single_link_data_seen:
+            self.single_link_data_seen = True
+            self.log_event(
+                "连接", "link", "收到首个合法直流 V1 帧；推断蓝牙数据链路可用", "一对一接收器"
+            )
         for kind, _flags, _scan_id, _seq, payload in frames:
             if kind == DC_EVT_SCAN_BEGIN:
                 self.dc_scan_points.clear()
@@ -690,6 +1444,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.clear_dc_scan_selection()
                 self.dc_scan_info.setText(f"扫描进行中：0 / {self.dc_points.value()} 点")
                 self.status_left.setText("DAC 扫描开始")
+                self.log_event("信息", "protocol", "DAC 扫描开始", "一对一传感器")
             elif kind == DC_EVT_SCAN_POINTS and payload:
                 offset = 1
                 for _ in range(payload[0]):
@@ -703,6 +1458,9 @@ class MainWindow(QtWidgets.QMainWindow):
             elif kind == DC_EVT_SCAN_END:
                 self.status_left.setText(f"DAC 扫描完成，共 {len(self.dc_scan_points)} 点")
                 self.dc_scan_info.setText(f"扫描完成：{len(self.dc_scan_points)} 点；点击数据点可查看坐标")
+                self.log_event(
+                    "信息", "protocol", f"DAC 扫描完成：{len(self.dc_scan_points)} 点", "一对一传感器"
+                )
             elif kind == DC_EVT_SENSOR_READINGS and payload:
                 offset = 1
                 now = time.time()
@@ -720,11 +1478,495 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_dirty = bool(frames) or self.plot_dirty
         self.update_status()
 
+    def ensure_multi_node(self, node_id):
+        if node_id in (MULTI_NODE_RELAY, MULTI_NODE_BROADCAST):
+            return None
+        node = self.multi_nodes.get(node_id)
+        if node is not None:
+            return node
+        if len(self.multi_nodes) >= len(MULTI_NODE_COLORS):
+            self.status_left.setText(f"忽略 NodeId 0x{node_id:04X}：当前界面最多显示 4 个节点")
+            return None
+        node = MultiNodeData(node_id=node_id, color_index=len(self.multi_nodes))
+        self.multi_nodes[node_id] = node
+        color = MULTI_NODE_COLORS[node.color_index]
+        self.multi_curves[node_id] = self.multi_plot.plot(
+            [], [], pen=pg.mkPen(color, width=1.5), name=f"CH{node.color_index + 1} · 0x{node_id:04X}"
+        )
+        if self.multi_selected_node_id is None:
+            self.multi_selected_node_id = node_id
+        self.update_multi_node_table()
+        self.log_event(
+            "发现", "link", f"首次发现 NodeId 0x{node_id:04X}，分配为 CH{node.color_index + 1}",
+            f"CH{node.color_index + 1} · 0x{node_id:04X}", color,
+        )
+        return node
+
+    def on_multi_bytes(self, chunk):
+        discarded_before = self.multi_parser.discarded_bytes
+        frames = self.multi_parser.feed(chunk)
+        discarded_delta = self.multi_parser.discarded_bytes - discarded_before
+        if discarded_delta:
+            self.log_event(
+                "警告", "problem", f"V2 帧校验/同步丢弃 {discarded_delta} 字节", "数据中继"
+            )
+        for frame in frames:
+            if frame.kind == MULTI_EVT_RAW_SAMPLES:
+                if frame.node_id == MULTI_NODE_RELAY:
+                    source, color = "数据中继", ""
+                else:
+                    source, color = self.multi_node_log_identity(frame.node_id)
+                diagnostic = frame.payload.decode("utf-8", errors="replace").strip("\x00\r\n ")
+                if not diagnostic:
+                    diagnostic = frame.payload.hex(" ").upper() or "<空诊断帧>"
+                self.log_event("设备", "device", diagnostic, source, color)
+                continue
+            if frame.kind == MULTI_EVT_RELAY_STATS and frame.node_id == MULTI_NODE_RELAY:
+                if len(frame.payload) >= 6:
+                    duplicate_count = int.from_bytes(frame.payload[3:6], "little")
+                    new_stats = (
+                        frame.payload[0], frame.payload[1], frame.payload[2], duplicate_count
+                    )
+                    if self.multi_relay_stats is None or new_stats[0] != self.multi_relay_stats[0]:
+                        self.log_event(
+                            "信息", "link", f"中继连接数更新：{new_stats[0]}，BLE 队列深度 {new_stats[1]}",
+                            "数据中继",
+                        )
+                    self.multi_relay_stats = new_stats
+                continue
+            node = self.ensure_multi_node(frame.node_id)
+            if node is None:
+                continue
+            node.frames += 1
+            node.last_seen = time.time()
+            if frame.kind == MULTI_EVT_COMMAND_TRACE:
+                stage = frame.payload[0] if frame.payload else 0
+                command = frame.payload[1] if len(frame.payload) >= 2 else 0
+                status = frame.payload[2] if len(frame.payload) >= 3 else 0
+                attempt = frame.payload[3] if len(frame.payload) >= 4 else 0
+                queue_depth = frame.payload[4] if len(frame.payload) >= 5 else 0
+                frame_length = frame.payload[5] if len(frame.payload) >= 6 else 0
+                observed = frame.payload[6] if len(frame.payload) >= 7 else 0
+                write_handle = (
+                    struct.unpack_from("<H", frame.payload, 7)[0]
+                    if len(frame.payload) >= 9 else 0
+                )
+                stage_name = MULTI_COMMAND_TRACE_NAMES.get(stage, f"未知链路阶段 {stage}")
+                command_name = MULTI_COMMAND_NAMES.get(command, f"命令 0x{command:02X}")
+                details = (
+                    f"{stage_name}：{command_name}；尝试 {attempt}；"
+                    f"BLE 队列 {queue_depth}；帧长 {frame_length}；"
+                    f"RX 句柄 0x{write_handle:04X}"
+                )
+                if observed:
+                    details += f"；传感器事件 0x{observed:02X}"
+                if status:
+                    details += f"；状态 0x{status:02X}"
+                identity, color = self.multi_node_log_identity(node.node_id)
+                if stage in (0x05, 0x06, 0x08, 0x09):
+                    level, category = "错误", "problem"
+                elif stage == 0x07:
+                    level, category = "重试", "problem"
+                elif stage in (0x02, 0x04):
+                    level, category = "确认", "protocol"
+                else:
+                    level, category = "链路", "protocol"
+                self.log_event(level, category, details, identity, color)
+                if stage in (0x08, 0x09) and command == MULTI_CMD_SCAN_START:
+                    node.scan_state = "failed"
+                    if node.node_id == self.multi_selected_node_id:
+                        self.multi_scan_info.setText(
+                            f"CH{node.color_index + 1} 扫描失败：{stage_name}"
+                        )
+            elif frame.kind == MULTI_EVT_LINK_STATUS:
+                previous_state = node.link_state
+                previous_stage = node.link_stage
+                previous_hci_reason = node.hci_reason
+                previous_gatt_error = node.gatt_error
+                if frame.payload:
+                    node.link_state = frame.payload[0]
+                    node.online = node.link_state == 1
+                    if (node.link_state == 0 and
+                            node.scan_state in ("waiting_ack", "accepted", "executing")):
+                        node.scan_state = "failed"
+                        if node.node_id == self.multi_selected_node_id:
+                            self.multi_scan_info.setText(
+                                f"CH{node.color_index + 1} 扫描失败：BLE 链路已断开"
+                            )
+                if len(frame.payload) >= 8:
+                    node.address = ":".join(f"{value:02X}" for value in frame.payload[2:8])
+                node.hci_reason = frame.payload[8] if len(frame.payload) >= 9 else 0
+                node.link_stage = frame.payload[9] if len(frame.payload) >= 10 else 0
+                node.gatt_error = frame.payload[10] if len(frame.payload) >= 11 else 0
+                node.att_mtu = (
+                    struct.unpack_from("<H", frame.payload, 11)[0]
+                    if len(frame.payload) >= 13 else 23
+                )
+                state_name = {0: "已断开", 1: "已就绪", 2: "发现中"}.get(
+                    node.link_state, f"状态 {node.link_state}"
+                )
+                self.status_left.setText(f"NodeId 0x{node.node_id:04X} {state_name}")
+                event_changed = (
+                    node.link_state != previous_state
+                    or node.link_stage != previous_stage
+                    or node.hci_reason != previous_hci_reason
+                    or node.gatt_error != previous_gatt_error
+                    or node.frames == 1
+                )
+                if event_changed:
+                    identity, color = self.multi_node_log_identity(node.node_id)
+                    if node.link_state == 0:
+                        level = "错误"
+                        details = [f"蓝牙连接已断开；地址 {node.address}"]
+                        if node.hci_reason:
+                            reason_name = MULTI_HCI_REASON_NAMES.get(
+                                node.hci_reason, "未收录的 HCI 原因"
+                            )
+                            details.append(
+                                f"HCI 0x{node.hci_reason:02X}（{reason_name}）"
+                            )
+                        if node.link_stage:
+                            details.append(
+                                "阶段 " + MULTI_GATT_STAGE_NAMES.get(
+                                    node.link_stage, f"未知 {node.link_stage}"
+                                )
+                            )
+                        if node.gatt_error:
+                            error_name = MULTI_GATT_ERROR_NAMES.get(
+                                node.gatt_error, "未收录的 GATT/中继错误"
+                            )
+                            details.append(
+                                f"错误 0x{node.gatt_error:02X}（{error_name}）"
+                            )
+                        message = "；".join(details)
+                    elif node.link_state == 1:
+                        level = "连接"
+                        message = (
+                            f"GATT 服务已就绪；ATT MTU={node.att_mtu}；地址 {node.address}"
+                        )
+                    elif node.link_state == 2:
+                        level = "发现"
+                        stage_name = MULTI_GATT_STAGE_NAMES.get(
+                            node.link_stage, f"未知阶段 {node.link_stage}"
+                        )
+                        message = (
+                            f"物理 BLE 已连接，GATT 阶段：{stage_name}；地址 {node.address}"
+                        )
+                    else:
+                        level = "警告"
+                        message = f"收到未知链路状态 {node.link_state}；地址 {node.address}"
+                    self.log_event(level, "link", message, identity, color)
+            elif frame.kind == MULTI_EVT_SENSOR_READINGS and frame.payload:
+                was_online = node.online
+                node.online = True
+                node.link_state = 1
+                if not was_online:
+                    identity, color = self.multi_node_log_identity(node.node_id)
+                    self.log_event(
+                        "连接", "link", "收到传感器读数；链路状态恢复为可用", identity, color
+                    )
+                offset = 1
+                now = time.time()
+                for sample_index in range(frame.payload[0]):
+                    if offset + 8 > len(frame.payload):
+                        break
+                    seq, dac, lockin, adc = struct.unpack_from("<HHHH", frame.payload, offset)
+                    timestamp = now + sample_index * 1e-6
+                    if self.multi_start_time is None:
+                        self.multi_start_time = timestamp
+                    node.rows.append((timestamp, seq, dac, lockin, adc))
+                    self.total_samples += 1
+                    offset += 8
+            elif frame.kind == MULTI_EVT_SCAN_BEGIN:
+                node.scan_points.clear()
+                node.scan_state = "executing"
+                node.scan_id = frame.scan_id
+                if len(frame.payload) >= 11:
+                    dac_min, dac_max, total_points, settle_ms = struct.unpack_from(
+                        "<HHHH", frame.payload, 0
+                    )
+                    average = frame.payload[8]
+                    restored_dac = struct.unpack_from("<H", frame.payload, 9)[0]
+                    node.scan_expected = total_points
+                    begin_message = (
+                        f"传感器开始 DAC 扫描：{dac_min}→{dac_max}，"
+                        f"共 {total_points} 点，等待 {settle_ms} ms，"
+                        f"平均 {average} 次，完成后恢复 DAC={restored_dac}"
+                    )
+                else:
+                    begin_message = "传感器开始 DAC 扫描"
+                identity, color = self.multi_node_log_identity(node.node_id)
+                self.log_event("信息", "protocol", begin_message, identity, color)
+                if node.node_id == self.multi_selected_node_id:
+                    self.multi_scan_curve.setData([], [])
+                    self.multi_scan_info.setText(
+                        f"CH{node.color_index + 1} 传感器正在执行：0 / {node.scan_expected} 点"
+                    )
+                    self.multi_plot_tabs.setCurrentIndex(1)
+            elif frame.kind == MULTI_EVT_SCAN_POINTS and frame.payload:
+                offset = 1
+                added = 0
+                for _ in range(frame.payload[0]):
+                    if offset + 5 > len(frame.payload):
+                        break
+                    index = frame.payload[offset]
+                    dac, lockin = struct.unpack_from("<HH", frame.payload, offset + 1)
+                    node.scan_points.append((index, dac, lockin))
+                    offset += 5
+                    added += 1
+                identity, color = self.multi_node_log_identity(node.node_id)
+                self.log_event(
+                    "进度", "protocol",
+                    f"传感器返回 {added} 个扫描点，累计 "
+                    f"{len(node.scan_points)} / {node.scan_expected or '?'} 点",
+                    identity, color,
+                )
+                if node.node_id == self.multi_selected_node_id:
+                    self.refresh_multi_scan_plot()
+            elif frame.kind == MULTI_EVT_SCAN_END:
+                result = frame.payload[0] if frame.payload else 0
+                completed = len(node.scan_points)
+                restored_dac = None
+                if len(frame.payload) >= 5:
+                    completed, restored_dac = struct.unpack_from("<HH", frame.payload, 1)
+                node.scan_state = "completed" if result == 0 else "aborted"
+                if node.node_id == self.multi_selected_node_id:
+                    self.multi_scan_info.setText(
+                        f"CH{node.color_index + 1} 扫描"
+                        f"{'完成' if result == 0 else '中止'}：{completed} 点"
+                        + (f"，DAC 已恢复为 {restored_dac}" if restored_dac is not None else "")
+                    )
+                self.status_left.setText(
+                    f"NodeId 0x{node.node_id:04X} DAC 扫描"
+                    f"{'完成' if result == 0 else '中止'}，共 {completed} 点"
+                )
+                identity, color = self.multi_node_log_identity(node.node_id)
+                self.log_event(
+                    "信息" if result == 0 else "警告", "protocol",
+                    f"传感器报告 DAC 扫描{'完成' if result == 0 else '中止'}：{completed} 点"
+                    + (f"，恢复 DAC={restored_dac}" if restored_dac is not None else ""),
+                    identity, color,
+                )
+            elif frame.kind == MULTI_EVT_ACK:
+                original = frame.payload[0] if frame.payload else 0
+                status = frame.payload[1] if len(frame.payload) >= 2 else 0
+                command_name = MULTI_COMMAND_NAMES.get(original, f"命令 0x{original:02X}")
+                status_name = MULTI_STATUS_NAMES.get(status, f"状态码 0x{status:02X}")
+                self.status_left.setText(
+                    f"NodeId 0x{node.node_id:04X} 传感器已确认：{command_name}（{status_name}）"
+                )
+                if original == MULTI_CMD_SCAN_START and status == 0:
+                    node.scan_state = "accepted"
+                    if node.node_id == self.multi_selected_node_id:
+                        self.multi_scan_info.setText(
+                            f"CH{node.color_index + 1} 传感器已接受命令，等待扫描开始："
+                            f"0 / {node.scan_expected} 点"
+                        )
+                identity, color = self.multi_node_log_identity(node.node_id)
+                self.log_event(
+                    "确认", "protocol",
+                    f"传感器 ACK：{command_name}，{status_name}", identity, color
+                )
+            elif frame.kind == MULTI_EVT_NACK:
+                reason = frame.payload[1] if len(frame.payload) >= 2 else 0
+                original = frame.payload[0] if frame.payload else 0
+                command_name = MULTI_COMMAND_NAMES.get(original, f"命令 0x{original:02X}")
+                reason_name = MULTI_STATUS_NAMES.get(reason, f"原因码 0x{reason:02X}")
+                self.status_left.setText(
+                    f"NodeId 0x{node.node_id:04X} 未执行 {command_name}：{reason_name}"
+                )
+                if original == MULTI_CMD_SCAN_START:
+                    node.scan_state = "failed"
+                    if node.node_id == self.multi_selected_node_id:
+                        self.multi_scan_info.setText(
+                            f"CH{node.color_index + 1} 扫描未启动：{reason_name}"
+                        )
+                identity, color = self.multi_node_log_identity(node.node_id)
+                self.log_event(
+                    "错误", "problem", f"NACK：{command_name}，{reason_name}",
+                    identity, color,
+                )
+        if frames:
+            self.trim_multi_buffers()
+            self.update_multi_node_table()
+            self.multi_plot_dirty = True
+        self.update_status()
+
+    def update_multi_node_table(self):
+        if not hasattr(self, "multi_node_table"):
+            return
+        nodes = sorted(self.multi_nodes.values(), key=lambda item: item.color_index)
+        self.multi_node_table.blockSignals(True)
+        self.multi_node_table.setRowCount(len(nodes))
+        is_dc = self.dc_mode.isChecked()
+        selected_row = -1
+        for row, node in enumerate(nodes):
+            color = QtGui.QColor(MULTI_NODE_COLORS[node.color_index])
+            channel = QtWidgets.QTableWidgetItem(f"● CH{node.color_index + 1}")
+            channel.setForeground(QtGui.QBrush(color))
+            channel.setData(QtCore.Qt.UserRole, node.node_id)
+            if node.link_state == 2:
+                state_text = "发现中"
+            else:
+                state_text = "在线" if node.online else "离线"
+            latest = "--"
+            if node.rows:
+                latest = str(node.rows[-1][3] if is_dc else node.rows[-1][4])
+            values = [channel, QtWidgets.QTableWidgetItem(state_text),
+                      QtWidgets.QTableWidgetItem(f"0x{node.node_id:04X}"),
+                      QtWidgets.QTableWidgetItem(str(node.frames)),
+                      QtWidgets.QTableWidgetItem(latest)]
+            for column, item in enumerate(values):
+                self.multi_node_table.setItem(row, column, item)
+            if node.node_id == self.multi_selected_node_id:
+                selected_row = row
+        if selected_row >= 0:
+            self.multi_node_table.selectRow(selected_row)
+        self.multi_node_table.blockSignals(False)
+        online = sum(1 for node in nodes if node.online)
+        self.multi_online_badge.setText(f"{online} / 4 在线")
+        self.update_multi_target_label()
+
+    def on_multi_node_selected(self):
+        row = self.multi_node_table.currentRow()
+        item = self.multi_node_table.item(row, 0) if row >= 0 else None
+        if item is None:
+            return
+        self.multi_selected_node_id = item.data(QtCore.Qt.UserRole)
+        self.update_multi_target_label()
+        self.refresh_multi_scan_plot()
+        self.multi_plot_dirty = True
+
+    def update_multi_target_label(self):
+        node = self.multi_nodes.get(self.multi_selected_node_id)
+        if node is None:
+            self.multi_target_label.setText("控制目标：尚未发现节点")
+            self.multi_target_label.setToolTip("")
+            return
+        state = "在线" if node.online else "离线"
+        self.multi_target_label.setText(
+            f"控制目标：CH{node.color_index + 1} · 0x{node.node_id:04X} · {state}"
+        )
+        self.multi_target_label.setToolTip(f"BLE 地址：{node.address}")
+
+    def send_multi(self, frame_type, payload=b"", flags=0):
+        if not self.connect_button.isChecked():
+            self.show_error("请先连接数据中继串口。")
+            return False
+        node = self.multi_nodes.get(self.multi_selected_node_id)
+        if node is None:
+            self.show_error("请先在节点机架中选择一个传感器。")
+            return False
+        if not node.online:
+            self.show_error(f"NodeId 0x{node.node_id:04X} 当前不在线，未发送命令。")
+            return False
+        packet = multi_encode(
+            frame_type, node.node_id, flags, self.multi_scan_id, self.multi_seq, payload
+        )
+        self.request_write.emit(packet)
+        identity, color = self.multi_node_log_identity(node.node_id)
+        self.log_event(
+            "信息", "protocol",
+            f"发送命令 0x{frame_type:02X}，ScanId={self.multi_scan_id}，Seq={self.multi_seq}",
+            identity, color,
+        )
+        self.multi_seq = (self.multi_seq + 1) & 0xFFFF
+        return True
+
+    def start_multi_dc_scan(self):
+        if self.multi_dc_min.value() > self.multi_dc_max.value():
+            self.show_error("DAC 起点不能大于终点。")
+            return
+        payload = struct.pack(
+            "<HHHHB", self.multi_dc_min.value(), self.multi_dc_max.value(),
+            self.multi_dc_points.value(), self.multi_dc_settle.value(),
+            self.multi_dc_average.value(),
+        )
+        self.multi_scan_id = (self.multi_scan_id + 1) & 0xFFFF
+        if self.send_multi(MULTI_CMD_SCAN_START, payload):
+            node = self.multi_nodes[self.multi_selected_node_id]
+            node.scan_points.clear()
+            node.scan_expected = self.multi_dc_points.value()
+            node.scan_state = "waiting_ack"
+            node.scan_id = self.multi_scan_id
+            self.multi_scan_curve.setData([], [])
+            self.multi_scan_info.setText(
+                f"CH{node.color_index + 1} 扫描命令已发送：0 / {self.multi_dc_points.value()} 点"
+            )
+            self.multi_plot_tabs.setCurrentIndex(1)
+
+    def abort_multi_dc_scan(self):
+        if self.send_multi(MULTI_CMD_ABORT):
+            self.status_left.setText("已向选中节点发送终止扫描命令")
+
+    def set_multi_dc_dac(self, save):
+        value = self.multi_dc_value.value()
+        flags = MULTI_SET_DAC_FLAG_SAVE if save else 0
+        if self.send_multi(MULTI_CMD_SET_DAC, struct.pack("<H", value), flags):
+            self.status_left.setText(f"已向选中节点设置 DAC={value}" + ("（保存）" if save else ""))
+
+    def refresh_multi_scan_plot(self):
+        node = self.multi_nodes.get(self.multi_selected_node_id)
+        if node is None or not node.scan_points:
+            self.multi_scan_curve.setData([], [])
+            if node is None:
+                self.multi_scan_info.setText("选择节点后可执行 DAC 扫描")
+            elif node.scan_state == "waiting_ack":
+                self.multi_scan_info.setText(
+                    f"CH{node.color_index + 1} 等待中继/传感器确认：0 / {node.scan_expected} 点"
+                )
+            elif node.scan_state == "accepted":
+                self.multi_scan_info.setText(
+                    f"CH{node.color_index + 1} 传感器已接受命令，等待扫描开始："
+                    f"0 / {node.scan_expected} 点"
+                )
+            elif node.scan_state == "executing":
+                self.multi_scan_info.setText(
+                    f"CH{node.color_index + 1} 传感器正在执行：0 / {node.scan_expected} 点"
+                )
+            return
+        x = np.asarray([point[1] for point in node.scan_points], dtype=np.float64)
+        y = np.asarray([point[2] for point in node.scan_points], dtype=np.float64)
+        color = MULTI_NODE_COLORS[node.color_index]
+        self.multi_scan_curve.setPen(pg.mkPen(color, width=1.6))
+        self.multi_scan_curve.setSymbolBrush(pg.mkBrush(color))
+        self.multi_scan_curve.setData(x, y)
+        x_pad = max(1.0, float(np.ptp(x)) * 0.04)
+        y_pad = max(1.0, float(np.ptp(y)) * 0.08)
+        self.multi_scan_plot.setXRange(float(np.min(x) - x_pad), float(np.max(x) + x_pad), padding=0)
+        self.multi_scan_plot.setYRange(float(np.min(y) - y_pad), float(np.max(y) + y_pad), padding=0)
+        self.multi_scan_info.setText(
+            f"CH{node.color_index + 1} · NodeId 0x{node.node_id:04X} · "
+            f"扫描进行中 {len(node.scan_points)} / {node.scan_expected or '?'} 点"
+        )
+
+    def export_multi_dc_scan(self):
+        node = self.multi_nodes.get(self.multi_selected_node_id)
+        if node is None or not node.scan_points:
+            self.show_error("选中节点当前没有 DAC 扫描点可导出。")
+            return
+        default = f"node_{node.node_id:04X}_dac_scan_{datetime.now():%Y%m%d_%H%M%S}.csv"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "导出选中节点 DAC 扫描点", str(Path.home() / default), "CSV 文件 (*.csv)"
+        )
+        if not path:
+            return
+        with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["node_id", "index", "dac", "lockin"])
+            for index, dac, lockin in node.scan_points:
+                writer.writerow([f"0x{node.node_id:04X}", index, dac, lockin])
+        self.statusBar().showMessage(f"扫描点已保存：{path}", 6000)
+
     def send_dc(self, frame_type, payload=b"", flags=0):
         if not self.connect_button.isChecked():
             self.show_error("请先连接直流传感器串口。")
             return False
         self.request_write.emit(dc_encode(frame_type, flags, 1, self.dc_seq, payload))
+        self.log_event(
+            "信息", "protocol", f"发送直流 V1 命令 0x{frame_type:02X}，Seq={self.dc_seq}",
+            "一对一传感器",
+        )
         self.dc_seq = (self.dc_seq + 1) & 0xFFFF
         return True
 
@@ -799,7 +2041,174 @@ class MainWindow(QtWidgets.QMainWindow):
             writer.writerows(self.dc_scan_points)
         self.statusBar().showMessage(f"扫描点已保存：{path}", 6000)
 
+    def trim_multi_buffers(self):
+        if self.multi_hold_data.isChecked() or self.show_all_data():
+            return
+        duration = self.duration_seconds()
+        if duration is None:
+            return
+        cutoff = time.time() - duration
+        for node in self.multi_nodes.values():
+            while node.rows and node.rows[0][0] < cutoff:
+                node.rows.popleft()
+
+    def refresh_multi_plot(self):
+        if not self.multi_plot_dirty or self.multi_paused:
+            return
+        selected = self.multi_nodes.get(self.multi_selected_node_id)
+        if self.multi_show_all.isChecked():
+            visible_ids = {node.node_id for node in self.multi_nodes.values() if node.online}
+        else:
+            visible_ids = {selected.node_id} if selected is not None else set()
+        duration = self.duration_seconds()
+        cutoff = time.time() - duration if duration is not None else None
+        base = self.multi_start_time
+        time_scale, time_unit, _decimals = self.time_display_settings()
+        self.multi_plot.setLabel("bottom", "相对采集时间", units=time_unit)
+        minimum_x = None
+        maximum_x = None
+        selected_values = np.empty(0)
+        is_dc = self.dc_mode.isChecked()
+        for node_id, curve in self.multi_curves.items():
+            node = self.multi_nodes.get(node_id)
+            show = node is not None and node_id in visible_ids
+            curve.setVisible(show)
+            if not show:
+                continue
+            rows = list(node.rows)
+            if cutoff is not None:
+                rows = [row for row in rows if row[0] >= cutoff]
+            if not rows:
+                curve.setData([], [])
+                continue
+            if base is None:
+                base = rows[0][0]
+            x = np.asarray([(row[0] - base) * time_scale for row in rows], dtype=np.float64)
+            values = np.asarray(
+                [row[3] if is_dc else row[4] for row in rows], dtype=np.float64
+            )
+            curve.setData(x, values, skipFiniteCheck=True)
+            minimum_x = float(x[0]) if minimum_x is None else min(minimum_x, float(x[0]))
+            maximum_x = float(x[-1]) if maximum_x is None else max(maximum_x, float(x[-1]))
+            if node_id == self.multi_selected_node_id:
+                selected_values = values
+        if minimum_x is not None:
+            right = maximum_x if maximum_x > minimum_x else minimum_x + 1.0
+            self.multi_plot.setXRange(minimum_x, right, padding=0)
+            if self.multi_auto_y.isChecked():
+                self.multi_plot.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
+        self.update_multi_stats(selected_values)
+        self.multi_plot_dirty = False
+
+    def update_multi_stats(self, values):
+        values = np.asarray(values, dtype=np.float64)
+        self.multi_last_stats_values = values.copy()
+        if values.size == 0:
+            latest = pp = rms = mean = minimum = maximum = "--"
+        else:
+            latest = f"{int(round(values[-1]))}"
+            pp = f"{int(np.ptp(values))}"
+            rms = f"{np.sqrt(np.mean(np.square(values))):.3f}"
+            mean = f"{np.mean(values):.3f}"
+            minimum = f"{int(np.min(values))}"
+            maximum = f"{int(np.max(values))}"
+        self.multi_latest_label.setText(f"最新值：{latest}")
+        self.multi_pp_label.setText(f"峰峰值：{pp}")
+        self.multi_rms_label.setText(f"有效值：{rms}")
+        self.multi_mean_label.setText(f"平均值：{mean}")
+        self.multi_range_label.setText(f"最小/最大：{minimum} / {maximum}")
+        self.multi_samples_label.setText(f"窗口点数：{values.size:,}")
+
+    def mark_multi_dirty(self, _value=None):
+        self.multi_plot_dirty = True
+
+    def toggle_multi_pause(self, checked):
+        self.multi_paused = checked
+        self.multi_pause_button.setText("继续显示" if checked else "暂停显示")
+        if not checked:
+            self.multi_plot_dirty = True
+
+    def on_multi_auto_y(self, checked):
+        self.multi_plot.enableAutoRange(axis=pg.ViewBox.YAxis, enable=checked)
+        if checked:
+            self.multi_plot.autoRange()
+
+    def clear_multi_data(self, reset_nodes=False):
+        if not hasattr(self, "multi_plot"):
+            return
+        self.multi_parser.clear()
+        self.multi_start_time = None
+        self.multi_relay_stats = None
+        self.multi_scan_id = 1
+        self.multi_seq = 1
+        if reset_nodes:
+            for curve in self.multi_curves.values():
+                self.multi_plot.removeItem(curve)
+            legend = self.multi_plot.plotItem.legend
+            if legend is not None:
+                legend.clear()
+            self.multi_nodes.clear()
+            self.multi_curves.clear()
+            self.multi_selected_node_id = None
+        else:
+            for node in self.multi_nodes.values():
+                node.rows.clear()
+                node.scan_points.clear()
+                node.scan_expected = 0
+                node.scan_state = "idle"
+                node.scan_id = 0
+                curve = self.multi_curves.get(node.node_id)
+                if curve is not None:
+                    curve.setData([], [])
+        self.multi_scan_curve.setData([], [])
+        self.multi_scan_info.setText("选择节点后可执行 DAC 扫描")
+        self.update_multi_stats(np.empty(0))
+        self.update_multi_node_table()
+        self.multi_plot_dirty = True
+        if self.is_multi_mode():
+            self.total_samples = 0
+            self.total_bytes = 0
+            self.update_status()
+
+    def save_multi_data(self):
+        rows = []
+        for node in sorted(self.multi_nodes.values(), key=lambda item: item.color_index):
+            rows.extend((node.node_id, node.color_index + 1, *row) for row in node.rows)
+        if not rows:
+            self.show_error("当前没有可保存的多节点数据。")
+            return
+        rows.sort(key=lambda row: row[2])
+        mode = "dc" if self.dc_mode.isChecked() else "ac"
+        default = f"multi_{mode}_sensor_data_{datetime.now():%Y%m%d_%H%M%S}.csv"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "导出多节点数据", str(Path.home() / default), "CSV 文件 (*.csv)"
+        )
+        if not path:
+            return
+        start = rows[0][2]
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+                writer = csv.writer(handle)
+                writer.writerow([
+                    "node_id", "channel", "timestamp", "elapsed_s", "seq",
+                    "dac", "lockin", "adc", "display_field", "display_value",
+                ])
+                for node_id, channel, timestamp, seq, dac, lockin, adc in rows:
+                    display_field = "lockin" if self.dc_mode.isChecked() else "adc"
+                    display_value = lockin if self.dc_mode.isChecked() else adc
+                    writer.writerow([
+                        f"0x{node_id:04X}", channel, f"{timestamp:.6f}",
+                        f"{timestamp - start:.6f}", seq, dac, lockin, adc,
+                        display_field, display_value,
+                    ])
+            self.statusBar().showMessage(f"多节点数据已保存：{path}", 6000)
+        except Exception as exc:
+            self.show_error(f"保存失败：{exc}")
+
     def trim_buffer(self):
+        if self.is_multi_mode():
+            self.trim_multi_buffers()
+            return
         if self.hold_data.isChecked() or self.show_all_data():
             return
         if self.dc_mode.isChecked():
@@ -820,6 +2229,9 @@ class MainWindow(QtWidgets.QMainWindow):
         return np.concatenate(tuple(self.sample_chunks))
 
     def refresh_plot(self):
+        if self.is_multi_mode():
+            self.refresh_multi_plot()
+            return
         if not self.plot_dirty or self.paused:
             return
         data = self.get_data()
@@ -1057,7 +2469,10 @@ class MainWindow(QtWidgets.QMainWindow):
         return self.duration_combo.currentText().strip() in ("全部", "all", "All", "ALL")
 
     def mark_dirty(self):
-        self.plot_dirty = True
+        if self.is_multi_mode():
+            self.multi_plot_dirty = True
+        else:
+            self.plot_dirty = True
 
     def clear_data(self):
         self.parser.clear()
@@ -1117,6 +2532,23 @@ class MainWindow(QtWidgets.QMainWindow):
             self.show_error(f"保存失败：{exc}")
 
     def update_status(self):
+        if self.is_multi_mode():
+            online = sum(1 for node in self.multi_nodes.values() if node.online)
+            readings = sum(len(node.rows) for node in self.multi_nodes.values())
+            scan_points = sum(len(node.scan_points) for node in self.multi_nodes.values())
+            self.status_right.setStyleSheet("")
+            text = (
+                f"V2 有效帧 {self.multi_parser.valid_frames} | 在线 {online}/4 | "
+                f"接收 {self.total_bytes:,} B | 队列读数 {readings:,} | "
+                f"扫描点 {scan_points:,} | 丢弃 {self.multi_parser.discarded_bytes:,} B"
+            )
+            if self.multi_relay_stats is not None:
+                links, ble_depth, pc_free, duplicates = self.multi_relay_stats
+                text += (
+                    f" | 中继链路 {links} | BLE队列 {ble_depth} | PC空闲槽 {pc_free} | 去重 {duplicates}"
+                )
+            self.status_right.setText(text)
+            return
         if self.dc_mode.isChecked():
             self.status_right.setStyleSheet("")
             self.status_right.setText(
@@ -1141,6 +2573,7 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.warning(self, APP_NAME, message)
 
     def closeEvent(self, event):
+        self.debug_log_window.hide()
         self.request_close.emit()
         self.worker_thread.quit()
         self.worker_thread.wait(1500)

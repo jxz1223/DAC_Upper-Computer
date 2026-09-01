@@ -5,13 +5,15 @@ __pycache__/
 
 # Local build environment and generated output
 .build-venv/
+.build-venv-multi/
 build/
 dist/
+dist_*/
 *.spec.tmp
 
 # Keep only the release executable used by the launcher.
 *.exe
-!SensorWaveformViewer_AC_DC_v2.exe
+!传感器波形查看器_交流直流合并版.exe
 
 # Runtime/output noise
 *.log
@@ -26,4 +28,3 @@ dist/
 Thumbs.db
 .vscode/
 .idea/
-

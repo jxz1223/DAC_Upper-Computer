@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='SensorWaveformViewer_New',
+    name='传感器波形查看器_交流直流合并版',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
