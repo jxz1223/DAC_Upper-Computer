@@ -37,6 +37,7 @@ MULTI_NODE_BROADCAST = 0xFFFF
 MULTI_CMD_SCAN_START = 0x10
 MULTI_CMD_SET_DAC = 0x11
 MULTI_CMD_ABORT = 0x12
+MULTI_CMD_RELEASE_LINK = 0x16
 MULTI_SET_DAC_FLAG_SAVE = 0x04
 MULTI_EVT_ACK = 0x80
 MULTI_EVT_NACK = 0x81
@@ -48,7 +49,11 @@ MULTI_EVT_RAW_SAMPLES = 0xA0
 MULTI_EVT_LINK_STATUS = 0xA1
 MULTI_EVT_RELAY_STATS = 0xA2
 MULTI_EVT_COMMAND_TRACE = 0xA3
-MULTI_NODE_COLORS = ("#22d3ee", "#f472b6", "#a3e635", "#fb923c")
+MULTI_MAX_NODES = 8
+MULTI_NODE_COLORS = (
+    "#22d3ee", "#f472b6", "#a3e635", "#fb923c",
+    "#a78bfa", "#facc15", "#60a5fa", "#f87171",
+)
 MULTI_GATT_STAGE_NAMES = {
     0: "无",
     1: "ATT MTU 协商",
@@ -87,6 +92,7 @@ MULTI_COMMAND_NAMES = {
     MULTI_CMD_SCAN_START: "开始 DAC 扫描",
     MULTI_CMD_SET_DAC: "设置 DAC",
     MULTI_CMD_ABORT: "终止 DAC 扫描",
+    MULTI_CMD_RELEASE_LINK: "断开并腾出位置",
 }
 MULTI_COMMAND_TRACE_NAMES = {
     0x00: "中继 UART 已收到并校验完整命令帧",
@@ -655,6 +661,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dc_seq = 1
         self.dc_start_time = None
         self.multi_nodes = {}
+        self.multi_archived_nodes = {}
+        self.multi_release_pending = {}
         self.multi_curves = {}
         self.multi_seq = 1
         self.multi_scan_id = 1
@@ -999,14 +1007,14 @@ class MainWindow(QtWidgets.QMainWindow):
         title = QtWidgets.QLabel("多节点采集台")
         title.setObjectName("multiTitle")
         self.multi_banner_detail = QtWidgets.QLabel(
-            "V2 NodeId 路由 · 最多 4 个传感器 · 串口固定建议 921600 baud"
+            f"V2 NodeId 路由 · 最多 {MULTI_MAX_NODES} 个传感器 · 串口固定建议 921600 baud"
         )
         self.multi_banner_detail.setObjectName("multiDetail")
         banner_layout.addWidget(title)
         banner_layout.addSpacing(12)
         banner_layout.addWidget(self.multi_banner_detail)
         banner_layout.addStretch(1)
-        self.multi_online_badge = QtWidgets.QLabel("0 / 4 在线")
+        self.multi_online_badge = QtWidgets.QLabel(f"0 / {MULTI_MAX_NODES} 在线")
         self.multi_online_badge.setObjectName("onlineBadge")
         banner_layout.addWidget(self.multi_online_badge)
         page_layout.addWidget(banner)
@@ -1041,10 +1049,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.multi_target_label = QtWidgets.QLabel("控制目标：尚未发现节点")
         self.multi_target_label.setObjectName("targetLabel")
         node_layout.addWidget(self.multi_target_label)
-        self.multi_node_table.setToolTip(
-            "节点按首次发现顺序固定为 CH1–CH4；点击一行选择 DAC/扫描命令目标。"
+        self.multi_release_button = QtWidgets.QPushButton("断开并腾出位置")
+        self.multi_release_button.setEnabled(False)
+        self.multi_release_button.setToolTip(
+            "断开选中设备（正在进行的扫描会中断）；暂缓重连 30 秒，让其他设备接入。"
+            "之后有空位时自动重连，无需手动允许。"
         )
-        left_layout.addWidget(node_box)
+        self.multi_release_button.clicked.connect(self.release_multi_link)
+        node_layout.addWidget(self.multi_release_button)
+        release_hint = QtWidgets.QLabel("断开后暂缓重连 30 秒，之后有空位自动重连")
+        release_hint.setWordWrap(True)
+        node_layout.addWidget(release_hint)
+        self.multi_node_table.setToolTip(
+            f"CH1–CH{MULTI_MAX_NODES} 的离线位置可被新设备复用；按 NodeId 区分设备。"
+            "点击一行选择控制目标；被替换设备的数据仍保留用于导出。"
+        )
+        left_layout.addWidget(node_box, 1)
 
         actions = QtWidgets.QGroupBox("显示与数据")
         actions_layout = QtWidgets.QGridLayout(actions)
@@ -1087,7 +1107,6 @@ class MainWindow(QtWidgets.QMainWindow):
         multi_stats_layout.addWidget(self.multi_mean_label, 2, 1)
         multi_stats_layout.addWidget(self.multi_range_label, 3, 0, 1, 2)
         left_layout.addWidget(multi_stats)
-        left_layout.addStretch(1)
         splitter.addWidget(left_panel)
 
         right_panel = QtWidgets.QWidget()
@@ -1200,7 +1219,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.debug_log_window.append_event(level, category, node, message, node_color)
 
     def multi_node_log_identity(self, node_id):
-        node = self.multi_nodes.get(node_id)
+        node = self.multi_nodes.get(node_id) or self.multi_archived_nodes.get(node_id)
         if node is None:
             return f"0x{node_id:04X}", ""
         color = MULTI_NODE_COLORS[node.color_index]
@@ -1240,7 +1259,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.multi_value_name.setText("当前字段：Lock-in" if is_dc else "当前字段：ADC")
         self.multi_plot.setLabel("left", "Lock-in" if is_dc else "ADC")
         self.multi_banner_detail.setText(
-            f"V2 NodeId 路由 · 最多 4 个传感器 · 当前显示 {'Lock-in' if is_dc else 'ADC'}"
+            f"V2 NodeId 路由 · 最多 {MULTI_MAX_NODES} 个传感器 · 当前显示 {'Lock-in' if is_dc else 'ADC'}"
         )
         self.clear_data()
         self.clear_multi_data(True)
@@ -1373,12 +1392,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.single_mode.setEnabled(not connected)
         self.multi_mode.setEnabled(not connected)
         if not connected and self.is_multi_mode():
+            self.multi_release_pending.clear()
             for node in self.multi_nodes.values():
                 node.online = False
                 node.link_state = 0
             self.update_multi_node_table()
             self.multi_plot_dirty = True
         self.single_link_data_seen = False if not connected else self.single_link_data_seen
+        self.update_multi_target_label()
         self.status_left.setText(("已连接：" if connected else "") + text)
         if connected:
             self.log_event("连接", "link", f"串口已打开：{text}", "串口")
@@ -1484,10 +1505,35 @@ class MainWindow(QtWidgets.QMainWindow):
         node = self.multi_nodes.get(node_id)
         if node is not None:
             return node
-        if len(self.multi_nodes) >= len(MULTI_NODE_COLORS):
-            self.status_left.setText(f"忽略 NodeId 0x{node_id:04X}：当前界面最多显示 4 个节点")
-            return None
-        node = MultiNodeData(node_id=node_id, color_index=len(self.multi_nodes))
+        if len(self.multi_nodes) >= MULTI_MAX_NODES:
+            offline = sorted(
+                (item for item in self.multi_nodes.values()
+                 if not item.online and item.link_state != 2),
+                key=lambda item: item.last_seen,
+            )
+            if not offline:
+                self.status_left.setText(
+                    f"忽略 NodeId 0x{node_id:04X}：当前 {MULTI_MAX_NODES} 个位置均被连接占用"
+                )
+                return None
+            retired = offline[0]
+            self.multi_archived_nodes[retired.node_id] = self.multi_nodes.pop(retired.node_id)
+            self.multi_plot.removeItem(self.multi_curves.pop(retired.node_id))
+            self.multi_release_pending.pop(retired.node_id, None)
+            if self.multi_selected_node_id == retired.node_id:
+                self.multi_selected_node_id = node_id
+            self.log_event(
+                "信息", "link",
+                f"离线 NodeId 0x{retired.node_id:04X} 的显示位置已腾出，历史数据保留用于导出",
+                "上位机",
+            )
+        occupied = {item.color_index for item in self.multi_nodes.values()}
+        color_index = next(i for i in range(MULTI_MAX_NODES) if i not in occupied)
+        node = self.multi_archived_nodes.pop(node_id, None)
+        returning = node is not None
+        if node is None:
+            node = MultiNodeData(node_id=node_id, color_index=color_index)
+        node.color_index = color_index
         self.multi_nodes[node_id] = node
         color = MULTI_NODE_COLORS[node.color_index]
         self.multi_curves[node_id] = self.multi_plot.plot(
@@ -1497,7 +1543,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.multi_selected_node_id = node_id
         self.update_multi_node_table()
         self.log_event(
-            "发现", "link", f"首次发现 NodeId 0x{node_id:04X}，分配为 CH{node.color_index + 1}",
+            "发现", "link", f"{'重新发现' if returning else '首次发现'} NodeId 0x{node_id:04X}，分配为 CH{node.color_index + 1}",
             f"CH{node.color_index + 1} · 0x{node_id:04X}", color,
         )
         return node
@@ -1533,6 +1579,26 @@ class MainWindow(QtWidgets.QMainWindow):
                             "数据中继",
                         )
                     self.multi_relay_stats = new_stats
+                continue
+            # Relay-local ACK confirms acceptance only; physical disconnect is
+            # confirmed separately by LINK_STATUS. Never resurrect a history slot.
+            if (frame.kind in (MULTI_EVT_ACK, MULTI_EVT_NACK) and frame.payload
+                    and frame.payload[0] == MULTI_CMD_RELEASE_LINK):
+                success = frame.kind == MULTI_EVT_ACK and len(frame.payload) >= 2 and frame.payload[1] == 0
+                if not success and self.multi_release_pending.get(frame.node_id) == frame.seq:
+                    self.multi_release_pending.pop(frame.node_id, None)
+                reason = frame.payload[1] if len(frame.payload) >= 2 else 0xFF
+                message = ("中继已接受释放请求，等待蓝牙实际断开；断开后 30 秒可自动重连"
+                           if success else "中继拒绝释放连接：" + MULTI_STATUS_NAMES.get(reason, f"0x{reason:02X}"))
+                identity, color = self.multi_node_log_identity(frame.node_id)
+                self.log_event("确认" if success else "错误", "link", message, identity, color)
+                self.status_left.setText(message)
+                continue
+            if (frame.node_id in self.multi_archived_nodes
+                    and frame.kind != MULTI_EVT_SENSOR_READINGS
+                    and not (frame.kind == MULTI_EVT_LINK_STATUS and frame.payload
+                             and frame.payload[0] in (1, 2))):
+                # Late ACK/disconnect/scan frames must not displace a new peer.
                 continue
             node = self.ensure_multi_node(frame.node_id)
             if node is None:
@@ -1616,8 +1682,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 if event_changed:
                     identity, color = self.multi_node_log_identity(node.node_id)
                     if node.link_state == 0:
-                        level = "错误"
+                        manual_release = self.multi_release_pending.pop(node.node_id, None) is not None
+                        level = "信息" if manual_release else "错误"
                         details = [f"蓝牙连接已断开；地址 {node.address}"]
+                        if manual_release:
+                            details.append("位置已释放；30 秒后有空位时自动重新连接")
                         if node.hci_reason:
                             reason_name = MULTI_HCI_REASON_NAMES.get(
                                 node.hci_reason, "未收录的 HCI 原因"
@@ -1824,7 +1893,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.multi_node_table.selectRow(selected_row)
         self.multi_node_table.blockSignals(False)
         online = sum(1 for node in nodes if node.online)
-        self.multi_online_badge.setText(f"{online} / 4 在线")
+        self.multi_online_badge.setText(f"{online} / {MULTI_MAX_NODES} 在线")
         self.update_multi_target_label()
 
     def on_multi_node_selected(self):
@@ -1839,6 +1908,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def update_multi_target_label(self):
         node = self.multi_nodes.get(self.multi_selected_node_id)
+        self.multi_release_button.setEnabled(
+            self.connect_button.isChecked() and node is not None
+            and (node.online or node.link_state == 2)
+        )
         if node is None:
             self.multi_target_label.setText("控制目标：尚未发现节点")
             self.multi_target_label.setToolTip("")
@@ -1857,12 +1930,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if node is None:
             self.show_error("请先在节点机架中选择一个传感器。")
             return False
-        if not node.online:
+        if not node.online and not (frame_type == MULTI_CMD_RELEASE_LINK and node.link_state == 2):
             self.show_error(f"NodeId 0x{node.node_id:04X} 当前不在线，未发送命令。")
             return False
         packet = multi_encode(
             frame_type, node.node_id, flags, self.multi_scan_id, self.multi_seq, payload
         )
+        if frame_type == MULTI_CMD_RELEASE_LINK:
+            self.multi_release_pending[node.node_id] = self.multi_seq
         self.request_write.emit(packet)
         identity, color = self.multi_node_log_identity(node.node_id)
         self.log_event(
@@ -1872,6 +1947,10 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.multi_seq = (self.multi_seq + 1) & 0xFFFF
         return True
+
+    def release_multi_link(self):
+        if self.send_multi(MULTI_CMD_RELEASE_LINK):
+            self.status_left.setText("已请求释放选中设备；收到实际断开事件后才算腾出位置")
 
     def start_multi_dc_scan(self):
         if self.multi_dc_min.value() > self.multi_dc_max.value():
@@ -2148,10 +2227,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if legend is not None:
                 legend.clear()
             self.multi_nodes.clear()
+            self.multi_archived_nodes.clear()
+            self.multi_release_pending.clear()
             self.multi_curves.clear()
             self.multi_selected_node_id = None
         else:
-            for node in self.multi_nodes.values():
+            for node in (*self.multi_nodes.values(), *self.multi_archived_nodes.values()):
                 node.rows.clear()
                 node.scan_points.clear()
                 node.scan_expected = 0
@@ -2172,7 +2253,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def save_multi_data(self):
         rows = []
-        for node in sorted(self.multi_nodes.values(), key=lambda item: item.color_index):
+        for node in sorted((*self.multi_nodes.values(), *self.multi_archived_nodes.values()),
+                           key=lambda item: (item.color_index, item.node_id)):
             rows.extend((node.node_id, node.color_index + 1, *row) for row in node.rows)
         if not rows:
             self.show_error("当前没有可保存的多节点数据。")
@@ -2538,7 +2620,7 @@ class MainWindow(QtWidgets.QMainWindow):
             scan_points = sum(len(node.scan_points) for node in self.multi_nodes.values())
             self.status_right.setStyleSheet("")
             text = (
-                f"V2 有效帧 {self.multi_parser.valid_frames} | 在线 {online}/4 | "
+                f"V2 有效帧 {self.multi_parser.valid_frames} | 在线 {online}/{MULTI_MAX_NODES} | "
                 f"接收 {self.total_bytes:,} B | 队列读数 {readings:,} | "
                 f"扫描点 {scan_points:,} | 丢弃 {self.multi_parser.discarded_bytes:,} B"
             )
