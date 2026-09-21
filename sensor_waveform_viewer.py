@@ -1,4 +1,5 @@
 import csv
+import secrets
 import struct
 import sys
 import time
@@ -38,13 +39,18 @@ MULTI_CMD_SCAN_START = 0x10
 MULTI_CMD_SET_DAC = 0x11
 MULTI_CMD_ABORT = 0x12
 MULTI_CMD_RELEASE_LINK = 0x16
+MULTI_CMD_RELAY_DISCHARGE = 0x17
+MULTI_RELAY_ACK_TIMEOUT_S = 4.0
+MULTI_RELAY_STATE_TIMEOUT_S = 8.0
 MULTI_SET_DAC_FLAG_SAVE = 0x04
+MULTI_FLAG_LOCKIN_CENTI = 0x08
 MULTI_EVT_ACK = 0x80
 MULTI_EVT_NACK = 0x81
 MULTI_EVT_SCAN_BEGIN = 0x90
 MULTI_EVT_SCAN_POINTS = 0x91
 MULTI_EVT_SCAN_END = 0x92
 MULTI_EVT_SENSOR_READINGS = 0x93
+MULTI_EVT_RELAY_STATE = 0x94
 MULTI_EVT_RAW_SAMPLES = 0xA0
 MULTI_EVT_LINK_STATUS = 0xA1
 MULTI_EVT_RELAY_STATS = 0xA2
@@ -93,6 +99,7 @@ MULTI_COMMAND_NAMES = {
     MULTI_CMD_SET_DAC: "设置 DAC",
     MULTI_CMD_ABORT: "终止 DAC 扫描",
     MULTI_CMD_RELEASE_LINK: "断开并腾出位置",
+    MULTI_CMD_RELAY_DISCHARGE: "继电器放电",
 }
 MULTI_COMMAND_TRACE_NAMES = {
     0x00: "中继 UART 已收到并校验完整命令帧",
@@ -131,6 +138,14 @@ def dc_crc16(data):
         for _ in range(8):
             crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
     return crc
+
+
+def decode_counted_records(payload, record_format):
+    """Reject an entire malformed batch before any readings reach the UI."""
+    record_size = struct.calcsize(record_format)
+    if not payload or len(payload) != 1 + payload[0] * record_size:
+        raise ValueError("点数与载荷长度不匹配")
+    return struct.iter_unpack(record_format, payload[1:])
 
 
 def dc_encode(frame_type, flags=0, scan_id=1, seq=1, payload=b""):
@@ -272,6 +287,12 @@ class MultiNodeData:
     scan_expected: int = 0
     scan_state: str = "idle"
     scan_id: int = 0
+    relay_level: int | None = None
+    relay_phase: str = "unknown"
+    relay_pending_seq: int | None = None
+    relay_pending_scan_id: int | None = None
+    relay_deadline: float = 0.0
+    relay_detail: str = ""
 
 
 class FrameParser:
@@ -664,8 +685,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.multi_archived_nodes = {}
         self.multi_release_pending = {}
         self.multi_curves = {}
-        self.multi_seq = 1
-        self.multi_scan_id = 1
+        # A new PC process may reconnect to a still-running BLE session. Independent
+        # random seeds avoid restarting with the sensor's last accepted request key.
+        self.multi_seq = secrets.randbelow(0xFFFF) + 1
+        self.multi_scan_id = secrets.randbelow(0xFFFF) + 1
         self.multi_start_time = None
         self.multi_selected_node_id = None
         self.multi_relay_stats = None
@@ -706,6 +729,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_timer = QtCore.QTimer(self)
         self.plot_timer.timeout.connect(self.refresh_plot)
         self.plot_timer.start(33)
+        self.relay_timer = QtCore.QTimer(self)
+        self.relay_timer.timeout.connect(self.check_multi_relay_timeouts)
+        self.relay_timer.start(250)
 
     def build_ui(self):
         pg.setConfigOptions(antialias=False, background="#0f172a", foreground="#cbd5e1")
@@ -768,12 +794,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.duration_combo = QtWidgets.QComboBox()
         self.duration_combo.setEditable(True)
         self.duration_combo.addItems([
-            "1 ms", "2 ms", "5 ms", "10 ms", "20 ms", "50 ms",
-            "100 ms", "200 ms", "500 ms", "1 s", "2 s", "5 s",
-            "10 s", "20 s", "30 s", "60 s", "2 min", "5 min", "10 min", "1 h", "全部",
+            "1 s", "2 s", "5 s",
+            "10 s", "20 s", "30 s", "60 s", "2 min", "5 min", "10 min", "30 min", "1 h", "全部",
         ])
         self.duration_combo.setCurrentText("5 s")
-        self.duration_combo.setToolTip("可选择常用毫秒/秒档位，也可输入如 25 ms 或 0.25 s")
+        self.duration_combo.setToolTip("可选择秒/分钟/小时档位，也可自定义输入如 15 s 或 10 min")
         self.duration_combo.currentTextChanged.connect(self.on_duration_changed)
         self.data_format = QtWidgets.QComboBox()
         self.data_format.addItems(["无符号16位（大端）", "有符号16位（大端）"])
@@ -934,6 +959,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot.setLabel("bottom", "时间", units="s")
         self.plot.setLabel("left", "采样值")
         self.plot.showGrid(x=True, y=True, alpha=0.25)
+        # Decimate only the rendered curve; stored samples, statistics and CSV stay complete.
+        self.plot.setDownsampling(auto=True, mode="peak")
         self.plot.addLegend(offset=(12, 12))
         self.curve = self.plot.plot([], [], pen=pg.mkPen("#22d3ee", width=1.4), name="传感器数据")
         self.ac_curve = self.plot.plot([], [], pen=pg.mkPen("#f59e0b", width=1.2), name="去直流偏置")
@@ -1113,6 +1140,24 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout = QtWidgets.QVBoxLayout(right_panel)
         right_layout.setContentsMargins(4, 0, 0, 0)
 
+        self.multi_relay_controls = QtWidgets.QGroupBox("继电器放电（选中节点）")
+        relay_layout = QtWidgets.QGridLayout(self.multi_relay_controls)
+        self.multi_relay_button = QtWidgets.QPushButton("继电器放电")
+        self.multi_relay_button.setEnabled(False)
+        self.multi_relay_button.clicked.connect(self.start_multi_relay_discharge)
+        self.multi_relay_button.setToolTip("仅向当前选中的在线节点发送一次 5 秒放电请求")
+        self.multi_relay_status = QtWidgets.QLabel("状态未知（等待设备上报）")
+        self.multi_relay_status.setWordWrap(True)
+        relay_hint = QtWidgets.QLabel(
+            "PD7 拉高 5 秒后由传感器自动拉低；断连不会中止，状态以设备反馈为准。"
+        )
+        relay_hint.setWordWrap(True)
+        relay_layout.addWidget(self.multi_relay_button, 0, 0)
+        relay_layout.addWidget(self.multi_relay_status, 0, 1)
+        relay_layout.addWidget(relay_hint, 1, 0, 1, 2)
+        relay_layout.setColumnStretch(1, 1)
+        right_layout.addWidget(self.multi_relay_controls)
+
         self.multi_dc_controls = QtWidgets.QGroupBox("选中节点 DAC 控制（V2 定向命令）")
         multi_dc_grid = QtWidgets.QGridLayout(self.multi_dc_controls)
         self.multi_dc_min = QtWidgets.QSpinBox(); self.multi_dc_min.setRange(0, 65535)
@@ -1147,6 +1192,7 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout.addWidget(self.multi_dc_controls)
 
         self.multi_plot = pg.PlotWidget()
+        self.multi_plot.setDownsampling(auto=True, mode="peak")
         self.multi_plot.setLabel("bottom", "相对采集时间", units="s")
         self.multi_plot.setLabel("left", "ADC")
         self.multi_plot.showGrid(x=True, y=True, alpha=0.25)
@@ -1393,9 +1439,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.multi_mode.setEnabled(not connected)
         if not connected and self.is_multi_mode():
             self.multi_release_pending.clear()
-            for node in self.multi_nodes.values():
+            for node in (*self.multi_nodes.values(), *self.multi_archived_nodes.values()):
                 node.online = False
                 node.link_state = 0
+                self.reset_multi_relay_state(node)
             self.update_multi_node_table()
             self.multi_plot_dirty = True
         self.single_link_data_seen = False if not connected else self.single_link_data_seen
@@ -1466,15 +1513,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.dc_scan_info.setText(f"扫描进行中：0 / {self.dc_points.value()} 点")
                 self.status_left.setText("DAC 扫描开始")
                 self.log_event("信息", "protocol", "DAC 扫描开始", "一对一传感器")
-            elif kind == DC_EVT_SCAN_POINTS and payload:
-                offset = 1
-                for _ in range(payload[0]):
-                    if offset + 5 > len(payload):
-                        break
-                    index = payload[offset]
-                    dac, lockin = struct.unpack_from("<HH", payload, offset + 1)
-                    self.dc_scan_points.append((index, dac, lockin))
-                    offset += 5
+            elif kind == DC_EVT_SCAN_POINTS:
+                try:
+                    points = decode_counted_records(payload, "<BHH")
+                except ValueError as exc:
+                    self.log_event("警告", "problem", f"丢弃 V1 扫描点：{exc}", "一对一传感器")
+                    continue
+                self.dc_scan_points.extend(points)
                 self.refresh_dc_scan_plot()
             elif kind == DC_EVT_SCAN_END:
                 self.status_left.setText(f"DAC 扫描完成，共 {len(self.dc_scan_points)} 点")
@@ -1482,19 +1527,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.log_event(
                     "信息", "protocol", f"DAC 扫描完成：{len(self.dc_scan_points)} 点", "一对一传感器"
                 )
-            elif kind == DC_EVT_SENSOR_READINGS and payload:
-                offset = 1
+            elif kind == DC_EVT_SENSOR_READINGS:
+                try:
+                    readings = decode_counted_records(payload, "<HHHH")
+                except ValueError as exc:
+                    self.log_event("警告", "problem", f"丢弃 V1 实时读数：{exc}", "一对一传感器")
+                    continue
                 now = time.time()
-                for sample_index in range(payload[0]):
-                    if offset + 8 > len(payload):
-                        break
-                    seq, dac, lockin, adc = struct.unpack_from("<HHHH", payload, offset)
+                for sample_index, (seq, dac, lockin, adc) in enumerate(readings):
                     timestamp = now + sample_index * 1e-6
                     if self.dc_start_time is None:
                         self.dc_start_time = timestamp
                     self.dc_rows.append((timestamp, seq, dac, lockin, adc))
                     self.total_samples += 1
-                    offset += 8
         self.trim_buffer()
         self.plot_dirty = bool(frames) or self.plot_dirty
         self.update_status()
@@ -1520,6 +1565,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.multi_archived_nodes[retired.node_id] = self.multi_nodes.pop(retired.node_id)
             self.multi_plot.removeItem(self.multi_curves.pop(retired.node_id))
             self.multi_release_pending.pop(retired.node_id, None)
+            self.reset_multi_relay_state(retired)
             if self.multi_selected_node_id == retired.node_id:
                 self.multi_selected_node_id = node_id
             self.log_event(
@@ -1534,6 +1580,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if node is None:
             node = MultiNodeData(node_id=node_id, color_index=color_index)
         node.color_index = color_index
+        self.reset_multi_relay_state(node)
         self.multi_nodes[node_id] = node
         color = MULTI_NODE_COLORS[node.color_index]
         self.multi_curves[node_id] = self.multi_plot.plot(
@@ -1600,6 +1647,8 @@ class MainWindow(QtWidgets.QMainWindow):
                              and frame.payload[0] in (1, 2))):
                 # Late ACK/disconnect/scan frames must not displace a new peer.
                 continue
+            if frame.kind == MULTI_EVT_RELAY_STATE and frame.node_id not in self.multi_nodes:
+                continue
             node = self.ensure_multi_node(frame.node_id)
             if node is None:
                 continue
@@ -1652,6 +1701,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 if frame.payload:
                     node.link_state = frame.payload[0]
                     node.online = node.link_state == 1
+                    if node.link_state != previous_state or not node.online:
+                        self.reset_multi_relay_state(node)
                     if (node.link_state == 0 and
                             node.scan_state in ("waiting_ack", "accepted", "executing")):
                         node.scan_state = "failed"
@@ -1725,27 +1776,36 @@ class MainWindow(QtWidgets.QMainWindow):
                         level = "警告"
                         message = f"收到未知链路状态 {node.link_state}；地址 {node.address}"
                     self.log_event(level, "link", message, identity, color)
-            elif frame.kind == MULTI_EVT_SENSOR_READINGS and frame.payload:
+            elif frame.kind == MULTI_EVT_RELAY_STATE:
+                self.on_multi_relay_state(node, frame)
+            elif frame.kind == MULTI_EVT_SENSOR_READINGS:
+                high_precision = bool(frame.flags & MULTI_FLAG_LOCKIN_CENTI)
+                try:
+                    readings = decode_counted_records(
+                        frame.payload, "<HHIH" if high_precision else "<HHHH"
+                    )
+                except ValueError as exc:
+                    identity, color = self.multi_node_log_identity(node.node_id)
+                    self.log_event("警告", "problem", f"丢弃 V2 实时读数：{exc}", identity, color)
+                    continue
                 was_online = node.online
                 node.online = True
                 node.link_state = 1
                 if not was_online:
+                    self.reset_multi_relay_state(node)
                     identity, color = self.multi_node_log_identity(node.node_id)
                     self.log_event(
                         "连接", "link", "收到传感器读数；链路状态恢复为可用", identity, color
                     )
-                offset = 1
                 now = time.time()
-                for sample_index in range(frame.payload[0]):
-                    if offset + 8 > len(frame.payload):
-                        break
-                    seq, dac, lockin, adc = struct.unpack_from("<HHHH", frame.payload, offset)
+                for sample_index, (seq, dac, lockin, adc) in enumerate(readings):
+                    if high_precision:
+                        lockin /= 100.0
                     timestamp = now + sample_index * 1e-6
                     if self.multi_start_time is None:
                         self.multi_start_time = timestamp
                     node.rows.append((timestamp, seq, dac, lockin, adc))
                     self.total_samples += 1
-                    offset += 8
             elif frame.kind == MULTI_EVT_SCAN_BEGIN:
                 node.scan_points.clear()
                 node.scan_state = "executing"
@@ -1772,16 +1832,21 @@ class MainWindow(QtWidgets.QMainWindow):
                         f"CH{node.color_index + 1} 传感器正在执行：0 / {node.scan_expected} 点"
                     )
                     self.multi_plot_tabs.setCurrentIndex(1)
-            elif frame.kind == MULTI_EVT_SCAN_POINTS and frame.payload:
-                offset = 1
+            elif frame.kind == MULTI_EVT_SCAN_POINTS:
+                high_precision = bool(frame.flags & MULTI_FLAG_LOCKIN_CENTI)
+                try:
+                    points = decode_counted_records(
+                        frame.payload, "<BHI" if high_precision else "<BHH"
+                    )
+                except ValueError as exc:
+                    identity, color = self.multi_node_log_identity(node.node_id)
+                    self.log_event("警告", "problem", f"丢弃 V2 扫描点：{exc}", identity, color)
+                    continue
                 added = 0
-                for _ in range(frame.payload[0]):
-                    if offset + 5 > len(frame.payload):
-                        break
-                    index = frame.payload[offset]
-                    dac, lockin = struct.unpack_from("<HH", frame.payload, offset + 1)
+                for index, dac, lockin in points:
+                    if high_precision:
+                        lockin /= 100.0
                     node.scan_points.append((index, dac, lockin))
-                    offset += 5
                     added += 1
                 identity, color = self.multi_node_log_identity(node.node_id)
                 self.log_event(
@@ -1816,6 +1881,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     + (f"，恢复 DAC={restored_dac}" if restored_dac is not None else ""),
                     identity, color,
                 )
+            elif (frame.kind in (MULTI_EVT_ACK, MULTI_EVT_NACK)
+                  and frame.payload[:1] == bytes([MULTI_CMD_RELAY_DISCHARGE])):
+                self.on_multi_relay_reply(node, frame)
             elif frame.kind == MULTI_EVT_ACK:
                 original = frame.payload[0] if frame.payload else 0
                 status = frame.payload[1] if len(frame.payload) >= 2 else 0
@@ -1880,7 +1948,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 state_text = "在线" if node.online else "离线"
             latest = "--"
             if node.rows:
-                latest = str(node.rows[-1][3] if is_dc else node.rows[-1][4])
+                latest = f"{node.rows[-1][3]:.2f}" if is_dc else str(node.rows[-1][4])
             values = [channel, QtWidgets.QTableWidgetItem(state_text),
                       QtWidgets.QTableWidgetItem(f"0x{node.node_id:04X}"),
                       QtWidgets.QTableWidgetItem(str(node.frames)),
@@ -1907,6 +1975,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.multi_plot_dirty = True
 
     def update_multi_target_label(self):
+        self.update_multi_relay_controls()
         node = self.multi_nodes.get(self.multi_selected_node_id)
         self.multi_release_button.setEnabled(
             self.connect_button.isChecked() and node is not None
@@ -1933,6 +2002,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if not node.online and not (frame_type == MULTI_CMD_RELEASE_LINK and node.link_state == 2):
             self.show_error(f"NodeId 0x{node.node_id:04X} 当前不在线，未发送命令。")
             return False
+        if frame_type == MULTI_CMD_RELAY_DISCHARGE:
+            if payload or flags or not self.can_start_multi_relay(node):
+                return False
+            # Arm before emitting so even a synchronous reply targets this request.
+            node.relay_level = None
+            node.relay_phase = "waiting_ack"
+            node.relay_pending_seq = self.multi_seq
+            node.relay_pending_scan_id = self.multi_scan_id
+            node.relay_deadline = time.monotonic() + MULTI_RELAY_ACK_TIMEOUT_S
+            node.relay_detail = ""
         packet = multi_encode(
             frame_type, node.node_id, flags, self.multi_scan_id, self.multi_seq, payload
         )
@@ -1947,6 +2026,144 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.multi_seq = (self.multi_seq + 1) & 0xFFFF
         return True
+
+    @staticmethod
+    def reset_multi_relay_state(node):
+        """A connection transition invalidates our knowledge of the physical GPIO."""
+        node.relay_level = None
+        node.relay_phase = "unknown"
+        node.relay_pending_seq = None
+        node.relay_pending_scan_id = None
+        node.relay_deadline = 0.0
+        node.relay_detail = ""
+
+    def can_start_multi_relay(self, node):
+        return (
+            self.is_multi_mode() and self.connect_button.isChecked()
+            and node is not None and node.online and node.relay_level != 1
+            and node.relay_phase not in ("waiting_ack", "waiting_state", "active", "busy")
+        )
+
+    def update_multi_relay_controls(self):
+        node = self.multi_nodes.get(self.multi_selected_node_id)
+        self.multi_relay_button.setEnabled(self.can_start_multi_relay(node))
+        if node is None:
+            self.multi_relay_status.setText("状态未知（尚未选择节点）")
+            return
+        prefix = f"CH{node.color_index + 1} · 0x{node.node_id:04X}："
+        if not self.connect_button.isChecked():
+            state = "状态未知（串口未连接）"
+        elif not node.online:
+            state = "状态未知（节点离线）"
+        else:
+            state = {
+                "unknown": "状态未知（等待设备上报）",
+                "waiting_ack": "等待确认（已发送 5 秒放电请求）",
+                "waiting_state": "已确认，等待设备状态",
+                "active": "正在放电：PD7 高电平（等待设备自动拉低）",
+                "low": "PD7 低电平",
+                "busy": "设备忙，等待状态反馈",
+                "timeout": "状态未知（反馈超时，可重试）",
+                "rejected": f"状态未知（请求被拒绝：{node.relay_detail}；可重试）",
+            }.get(node.relay_phase, "状态未知")
+            if node.relay_phase == "active" and node.relay_level == 0:
+                state = "PD7 低电平；等待当前放电请求反馈"
+        self.multi_relay_status.setText(prefix + state)
+
+    def start_multi_relay_discharge(self):
+        node = self.multi_nodes.get(self.multi_selected_node_id)
+        if not self.can_start_multi_relay(node):
+            self.update_multi_relay_controls()
+            return False
+        # Give each user request its own identifier; no automatic retries here.
+        self.multi_scan_id = ((self.multi_scan_id + 1) & 0xFFFF) or 1
+        if not self.send_multi(MULTI_CMD_RELAY_DISCHARGE):
+            return False
+        self.status_left.setText(f"已向 NodeId 0x{node.node_id:04X} 请求继电器放电 5 秒")
+        self.update_multi_relay_controls()
+        return True
+
+    def on_multi_relay_reply(self, node, frame):
+        identity, color = self.multi_node_log_identity(node.node_id)
+        if len(frame.payload) != 2:
+            self.log_event("警告", "problem", "丢弃继电器确认：载荷长度错误", identity, color)
+            return
+        if (frame.seq != node.relay_pending_seq
+                or frame.scan_id != node.relay_pending_scan_id):
+            self.log_event("信息", "protocol", "忽略非当前继电器请求的确认", identity, color)
+            return
+        status = frame.payload[1]
+        status_name = MULTI_STATUS_NAMES.get(status, f"状态码 0x{status:02X}")
+        if frame.kind == MULTI_EVT_ACK and status == 0:
+            # An ACK confirms acceptance, never the current pin level or completion.
+            if node.relay_level != 1:
+                node.relay_phase = "waiting_state"
+            node.relay_deadline = time.monotonic() + MULTI_RELAY_STATE_TIMEOUT_S
+            message = "继电器请求已确认；等待设备状态反馈"
+        else:
+            node.relay_pending_seq = None
+            node.relay_pending_scan_id = None
+            node.relay_detail = status_name
+            if node.relay_level == 1:
+                node.relay_phase = "active"
+                node.relay_deadline = time.monotonic() + MULTI_RELAY_STATE_TIMEOUT_S
+            elif status == 0x06:
+                node.relay_level = None
+                node.relay_phase = "busy"
+                node.relay_deadline = time.monotonic() + MULTI_RELAY_STATE_TIMEOUT_S
+            else:
+                node.relay_level = None
+                node.relay_phase = "rejected"
+                node.relay_deadline = 0.0
+            message = f"继电器请求未执行：{status_name}；未重新触发或延长放电"
+        self.log_event("确认" if status == 0 else "警告", "protocol", message, identity, color)
+        self.update_multi_relay_controls()
+
+    def on_multi_relay_state(self, node, frame):
+        identity, color = self.multi_node_log_identity(node.node_id)
+        if len(frame.payload) != 1 or frame.payload[0] not in (0, 1):
+            self.log_event("警告", "problem", "丢弃继电器状态：应为单字节 0 或 1", identity, color)
+            return
+        if not node.online:
+            # Late traffic must not revalidate state across a disconnect.
+            return
+        node.relay_level = frame.payload[0]
+        matching_request = (
+            node.relay_pending_seq is None or frame.scan_id == node.relay_pending_scan_id
+        )
+        if matching_request:
+            node.relay_pending_seq = None
+            node.relay_pending_scan_id = None
+        if node.relay_level == 1:
+            node.relay_phase = "active"
+            node.relay_deadline = time.monotonic() + MULTI_RELAY_STATE_TIMEOUT_S
+        elif matching_request:
+            node.relay_phase = "low"
+            node.relay_deadline = 0.0
+        # A low report for an earlier request is useful telemetry but cannot
+        # complete the new command while its acknowledgement is outstanding.
+        message = "继电器 PD7 高电平，正在放电" if node.relay_level else "继电器 PD7 低电平"
+        self.log_event("设备", "device", message, identity, color)
+        self.update_multi_relay_controls()
+
+    def check_multi_relay_timeouts(self):
+        now = time.monotonic()
+        changed = False
+        for node in self.multi_nodes.values():
+            if node.relay_deadline and now >= node.relay_deadline:
+                node.relay_level = None
+                node.relay_phase = "timeout"
+                node.relay_pending_seq = None
+                node.relay_pending_scan_id = None
+                node.relay_deadline = 0.0
+                identity, color = self.multi_node_log_identity(node.node_id)
+                self.log_event(
+                    "警告", "problem", "继电器反馈超时，当前电平未知；可手动重试，未自动重发",
+                    identity, color,
+                )
+                changed = True
+        if changed:
+            self.update_multi_relay_controls()
 
     def release_multi_link(self):
         if self.send_multi(MULTI_CMD_RELEASE_LINK):
@@ -2034,7 +2251,7 @@ class MainWindow(QtWidgets.QMainWindow):
             writer = csv.writer(handle)
             writer.writerow(["node_id", "index", "dac", "lockin"])
             for index, dac, lockin in node.scan_points:
-                writer.writerow([f"0x{node.node_id:04X}", index, dac, lockin])
+                writer.writerow([f"0x{node.node_id:04X}", index, dac, f"{lockin:.2f}"])
         self.statusBar().showMessage(f"扫描点已保存：{path}", 6000)
 
     def send_dc(self, frame_type, payload=b"", flags=0):
@@ -2088,11 +2305,11 @@ class MainWindow(QtWidgets.QMainWindow):
         scan_index = self.dc_scan_points[index][0] if 0 <= index < len(self.dc_scan_points) else index
         self.dc_scan_v.setPos(dac)
         self.dc_scan_h.setPos(lockin)
-        self.dc_scan_text.setText(f"序号 = {scan_index}\nDAC = {dac:.0f}\nLock-in = {lockin:.0f}")
+        self.dc_scan_text.setText(f"序号 = {scan_index}\nDAC = {dac:.0f}\nLock-in = {lockin:.2f}")
         self.dc_scan_text.setPos(dac, lockin)
         for item in (self.dc_scan_v, self.dc_scan_h, self.dc_scan_text):
             item.show()
-        self.dc_scan_info.setText(f"已选择：序号 {scan_index}，DAC = {dac:.0f}，Lock-in = {lockin:.0f}")
+        self.dc_scan_info.setText(f"已选择：序号 {scan_index}，DAC = {dac:.0f}，Lock-in = {lockin:.2f}")
 
     def clear_dc_scan_selection(self):
         for item in (self.dc_scan_v, self.dc_scan_h, self.dc_scan_text):
@@ -2117,7 +2334,7 @@ class MainWindow(QtWidgets.QMainWindow):
         with open(path, "w", newline="", encoding="utf-8-sig") as handle:
             writer = csv.writer(handle)
             writer.writerow(["index", "dac", "lockin"])
-            writer.writerows(self.dc_scan_points)
+            writer.writerows((index, dac, f"{lockin:.2f}") for index, dac, lockin in self.dc_scan_points)
         self.statusBar().showMessage(f"扫描点已保存：{path}", 6000)
 
     def trim_multi_buffers(self):
@@ -2185,12 +2402,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if values.size == 0:
             latest = pp = rms = mean = minimum = maximum = "--"
         else:
-            latest = f"{int(round(values[-1]))}"
-            pp = f"{int(np.ptp(values))}"
-            rms = f"{np.sqrt(np.mean(np.square(values))):.3f}"
-            mean = f"{np.mean(values):.3f}"
-            minimum = f"{int(np.min(values))}"
-            maximum = f"{int(np.max(values))}"
+            is_lockin = self.dc_mode.isChecked()
+            decimals = 2 if is_lockin else 3
+            latest = f"{values[-1]:.2f}" if is_lockin else f"{int(round(values[-1]))}"
+            pp = f"{np.ptp(values):.2f}" if is_lockin else f"{int(np.ptp(values))}"
+            rms = f"{np.sqrt(np.mean(np.square(values))):.{decimals}f}"
+            mean = f"{np.mean(values):.{decimals}f}"
+            minimum = f"{np.min(values):.2f}" if is_lockin else f"{int(np.min(values))}"
+            maximum = f"{np.max(values):.2f}" if is_lockin else f"{int(np.max(values))}"
         self.multi_latest_label.setText(f"最新值：{latest}")
         self.multi_pp_label.setText(f"峰峰值：{pp}")
         self.multi_rms_label.setText(f"有效值：{rms}")
@@ -2218,8 +2437,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.multi_parser.clear()
         self.multi_start_time = None
         self.multi_relay_stats = None
-        self.multi_scan_id = 1
-        self.multi_seq = 1
         if reset_nodes:
             for curve in self.multi_curves.values():
                 self.multi_plot.removeItem(curve)
@@ -2277,10 +2494,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 ])
                 for node_id, channel, timestamp, seq, dac, lockin, adc in rows:
                     display_field = "lockin" if self.dc_mode.isChecked() else "adc"
-                    display_value = lockin if self.dc_mode.isChecked() else adc
+                    display_value = f"{lockin:.2f}" if self.dc_mode.isChecked() else adc
                     writer.writerow([
                         f"0x{node_id:04X}", channel, f"{timestamp:.6f}",
-                        f"{timestamp - start:.6f}", seq, dac, lockin, adc,
+                        f"{timestamp - start:.6f}", seq, dac, f"{lockin:.2f}", adc,
                         display_field, display_value,
                     ])
             self.statusBar().showMessage(f"多节点数据已保存：{path}", 6000)
@@ -2412,15 +2629,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if values.size == 0:
             pp = rms = mean = ac_mean = ac_rms = minimum = maximum = "--"
         else:
-            pp = f"{int(np.ptp(values))}"
-            rms = f"{np.sqrt(np.mean(np.square(values))):.3f}"
+            is_lockin = self.dc_mode.isChecked()
+            decimals = 2 if is_lockin else 3
+            pp = f"{np.ptp(values):.2f}" if is_lockin else f"{int(np.ptp(values))}"
+            rms = f"{np.sqrt(np.mean(np.square(values))):.{decimals}f}"
             mean_value = np.mean(values)
-            mean = f"{mean_value:.3f}"
+            mean = f"{mean_value:.{decimals}f}"
             ac_values = values - mean_value
-            ac_mean = f"{np.mean(ac_values):.3f}"
-            ac_rms = f"{np.sqrt(np.mean(np.square(ac_values))):.3f}"
-            minimum = f"{int(np.min(values))}"
-            maximum = f"{int(np.max(values))}"
+            ac_mean = f"{np.mean(ac_values):.{decimals}f}"
+            ac_rms = f"{np.sqrt(np.mean(np.square(ac_values))):.{decimals}f}"
+            minimum = f"{np.min(values):.2f}" if is_lockin else f"{int(np.min(values))}"
+            maximum = f"{np.max(values):.2f}" if is_lockin else f"{int(np.max(values))}"
         self.pp_label.setText(f"峰峰值：{pp}")
         self.rms_label.setText(f"有效值：{rms}")
         self.mean_label.setText(f"平均值：{mean}")
@@ -2477,8 +2696,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cursor_v.setPos(px)
         self.cursor_h.setPos(py)
         _scale, unit, decimals = self.time_display_settings()
+        value_text = f"{py:.2f}" if self.dc_mode.isChecked() else str(int(round(py)))
         self.cursor_text.setText(
-            f"时间 = {px:.{decimals}f} {unit}\n十进制值 = {int(round(py))}"
+            f"时间 = {px:.{decimals}f} {unit}\n十进制值 = {value_text}"
         )
         self.cursor_text.setPos(px, py)
         for item in (self.cursor_v, self.cursor_h, self.cursor_text):
@@ -2603,7 +2823,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     rows = list(self.dc_rows)
                     start = rows[0][0]
                     for timestamp, seq, dac, lockin, adc in rows:
-                        writer.writerow([f"{timestamp:.6f}", f"{timestamp-start:.6f}", seq, dac, lockin, adc])
+                        writer.writerow([f"{timestamp:.6f}", f"{timestamp-start:.6f}", seq, dac, f"{lockin:.2f}", adc])
                 else:
                     writer.writerow(["sample_index", "time_s", "value"])
                     for offset, value in enumerate(data):
