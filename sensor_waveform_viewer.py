@@ -21,6 +21,21 @@ FRAME_HEADER = b"\x8f\x8e\x8f"
 FRAME_TRAILER = b"\x8e\x8f\x8e"
 SAMPLES_PER_FRAME = 120
 
+# Four-channel STM32WB sensor path. The receiver retains the BLE notification
+# inside a V1 UART envelope, so this is intentionally separate from DC V1 and
+# the multi-node V2 protocol below.
+FOUR_CHANNEL_OUTER_TYPE = 0xA0
+FOUR_CHANNEL_OUTER_MAX_PAYLOAD = 246
+FOUR_CHANNEL_WAVE_MAGIC = b"\xA6\x6A"
+FOUR_CHANNEL_WAVE_VERSION = 2
+FOUR_CHANNEL_WAVE_SIZE = 246
+FOUR_CHANNEL_WAVE_HEADER_SIZE = 12
+FOUR_CHANNEL_SAMPLE_COUNT = 76
+FOUR_CHANNEL_COUNT = 4
+FOUR_CHANNEL_DEFAULT_RATE = 2000
+FOUR_CHANNEL_NAMES = ("U4 / CH1", "U5 / CH2", "U6 / CH3", "U7 / CH4")
+FOUR_CHANNEL_COLORS = ("#22d3ee", "#10b981", "#f97316", "#a855f7")
+
 DC_MAGIC = b"\xA5\x5A"
 DC_VERSION = 1
 DC_CMD_SCAN_START = 0x10
@@ -334,6 +349,108 @@ class FrameParser:
                 del self.buffer[0]
                 self.discarded_bytes += 1
         return frames
+
+
+@dataclass(frozen=True)
+class FourChannelWaveFrame:
+    sequence: int
+    sample_rate: int
+    first_scan: int
+    samples: tuple[tuple[int, int, int], ...]
+
+
+class FourChannelFrameParser:
+    """Decode the receiver UART envelope and the nested four-channel BLE wave."""
+
+    def __init__(self):
+        self.buffer = bytearray()
+        self.valid_frames = 0
+        self.outer_crc_errors = 0
+        self.wave_errors = 0
+        self.discarded_bytes = 0
+
+    def clear(self):
+        self.buffer.clear()
+        self.valid_frames = 0
+        self.outer_crc_errors = 0
+        self.wave_errors = 0
+        self.discarded_bytes = 0
+
+    @staticmethod
+    def parse_wave(payload):
+        if (len(payload) != FOUR_CHANNEL_WAVE_SIZE
+                or payload[:2] != FOUR_CHANNEL_WAVE_MAGIC
+                or payload[2] != FOUR_CHANNEL_WAVE_VERSION
+                or payload[3] != FOUR_CHANNEL_SAMPLE_COUNT):
+            raise ValueError("四路波形帧头、版本或长度错误")
+        received = int.from_bytes(payload[-2:], "big")
+        if received != dc_crc16(payload[:-2]):
+            raise ValueError("四路波形 CRC 错误")
+
+        samples = []
+        for index in range(FOUR_CHANNEL_SAMPLE_COUNT):
+            offset = FOUR_CHANNEL_WAVE_HEADER_SIZE + index * 3
+            word = int.from_bytes(payload[offset:offset + 3], "big")
+            channel = (word >> 19) & 0x03
+            gain_code = (word >> 21) & 0x07
+            if channel != index % FOUR_CHANNEL_COUNT:
+                raise ValueError("四路波形通道标签或顺序错误")
+            samples.append((channel, word & 0x7FFFF, gain_code))
+
+        sample_rate = int.from_bytes(payload[6:8], "big")
+        if sample_rate == 0:
+            raise ValueError("四路波形采样率为 0")
+        return FourChannelWaveFrame(
+            sequence=int.from_bytes(payload[4:6], "big"),
+            sample_rate=sample_rate,
+            first_scan=int.from_bytes(payload[8:12], "big"),
+            samples=tuple(samples),
+        )
+
+    def feed(self, chunk):
+        self.buffer.extend(chunk)
+        waves = []
+        while True:
+            pos = self.buffer.find(DC_MAGIC)
+            if pos < 0:
+                keep = 1 if self.buffer and self.buffer[-1] == DC_MAGIC[0] else 0
+                self.discarded_bytes += len(self.buffer) - keep
+                self.buffer[:] = self.buffer[-keep:] if keep else b""
+                break
+            if pos:
+                del self.buffer[:pos]
+                self.discarded_bytes += pos
+            if len(self.buffer) < 12:
+                break
+            version, kind, _flags, _scan_id, _seq, size = struct.unpack_from(
+                "<BBBHHB", self.buffer, 2
+            )
+            if version != DC_VERSION or size > FOUR_CHANNEL_OUTER_MAX_PAYLOAD:
+                del self.buffer[0]
+                self.discarded_bytes += 1
+                continue
+            total = 12 + size
+            if len(self.buffer) < total:
+                break
+            received = struct.unpack_from("<H", self.buffer, 10 + size)[0]
+            expected = dc_crc16(bytes(self.buffer[2:10 + size]))
+            if received != expected:
+                del self.buffer[0]
+                self.outer_crc_errors += 1
+                self.discarded_bytes += 1
+                continue
+            payload = bytes(self.buffer[10:10 + size])
+            del self.buffer[:total]
+            if kind != FOUR_CHANNEL_OUTER_TYPE:
+                continue
+            try:
+                wave = self.parse_wave(payload)
+            except ValueError:
+                self.wave_errors += 1
+                continue
+            self.valid_frames += 1
+            waves.append(wave)
+        return waves
 
 
 class SerialWorker(QtCore.QObject):
@@ -677,6 +794,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.parser = FrameParser()
         self.dc_parser = DcFrameParser()
         self.multi_parser = MultiFrameParser()
+        self.four_channel_parser = FourChannelFrameParser()
         self.dc_rows = deque()
         self.dc_scan_points = []
         self.dc_seq = 1
@@ -697,6 +815,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.multi_last_stats_values = np.empty(0)
         self.sample_chunks = deque()
         self.sample_count = 0
+        self.four_channel_rows = [deque() for _ in range(FOUR_CHANNEL_COUNT)]
+        self.four_channel_rate = FOUR_CHANNEL_DEFAULT_RATE
+        self.four_last_sequence = None
+        self.four_start_scan = None
+        self.four_missing_frames = 0
+        self.four_plot_dirty = False
         self.total_samples = 0
         self.total_bytes = 0
         self.zero_frames = 0
@@ -755,13 +879,16 @@ class MainWindow(QtWidgets.QMainWindow):
         mode_row.addWidget(QtWidgets.QLabel("连接方式："))
         self.single_mode = QtWidgets.QRadioButton("一对一")
         self.multi_mode = QtWidgets.QRadioButton("一对多")
+        self.four_channel_mode = QtWidgets.QRadioButton("四路 ADC")
         self.single_mode.setChecked(True)
         self.topology_modes = QtWidgets.QButtonGroup(self)
         self.topology_modes.setExclusive(True)
         self.topology_modes.addButton(self.single_mode)
         self.topology_modes.addButton(self.multi_mode)
+        self.topology_modes.addButton(self.four_channel_mode)
         mode_row.addWidget(self.single_mode)
         mode_row.addWidget(self.multi_mode)
+        mode_row.addWidget(self.four_channel_mode)
         mode_row.addStretch(1)
         self.debug_log_button = QtWidgets.QPushButton("调试日志")
         self.debug_log_button.setObjectName("debugLogButton")
@@ -867,6 +994,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.show_ac_curve = QtWidgets.QCheckBox("显示去直流波形")
         self.show_ac_curve.setChecked(True)
         self.show_ac_curve.toggled.connect(self.mark_dirty)
+        self.four_channel_selector_label = QtWidgets.QLabel("统计通道")
+        self.four_channel_selector = QtWidgets.QComboBox()
+        self.four_channel_selector.addItems(FOUR_CHANNEL_NAMES)
+        self.four_channel_selector.currentIndexChanged.connect(self.mark_dirty)
+        self.four_channel_selector_label.hide()
+        self.four_channel_selector.hide()
         self.save_button = QtWidgets.QPushButton("保存数据")
         self.save_button.clicked.connect(self.save_data)
         self.clear_button = QtWidgets.QPushButton("清空界面")
@@ -875,7 +1008,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reset_view_button.clicked.connect(self.reset_view)
         for widget in (
             self.auto_y, self.pause_button, self.hold_data, self.show_sensor_curve,
-            self.show_ac_curve, self.save_button, self.clear_button, self.reset_view_button
+            self.show_ac_curve, self.four_channel_selector_label, self.four_channel_selector,
+            self.save_button, self.clear_button, self.reset_view_button
         ):
             action_row.addWidget(widget)
         action_row.addStretch(1)
@@ -1001,8 +1135,12 @@ class MainWindow(QtWidgets.QMainWindow):
         dc_scan_layout.setContentsMargins(0, 0, 0, 0)
         dc_scan_layout.addWidget(self.dc_scan_info)
         dc_scan_layout.addWidget(self.dc_scan_plot, 1)
+        self.realtime_stack = QtWidgets.QStackedWidget()
+        self.realtime_stack.addWidget(self.plot)
+        self.four_channel_plot_page = self.build_four_channel_plot_page()
+        self.realtime_stack.addWidget(self.four_channel_plot_page)
         self.plot_tabs = QtWidgets.QTabWidget()
-        self.plot_tabs.addTab(self.plot, "实时波形")
+        self.plot_tabs.addTab(self.realtime_stack, "实时波形")
         self.plot_tabs.addTab(dc_scan_page, "DAC 扫描曲线")
         single_layout.addWidget(self.plot_tabs, 1)
 
@@ -1018,8 +1156,53 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dc_mode.toggled.connect(self.on_sensor_mode_changed)
         self.single_mode.toggled.connect(self.on_topology_mode_changed)
         self.multi_mode.toggled.connect(self.on_topology_mode_changed)
+        self.four_channel_mode.toggled.connect(self.on_topology_mode_changed)
         self.apply_style()
         self.on_sensor_mode_changed()
+
+    def build_four_channel_plot_page(self):
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        hint = QtWidgets.QLabel(
+            "四路 ADC 独立显示；数值为发射端已完成增益归一化后的 19 位数据。"
+        )
+        hint.setObjectName("hintLabel")
+        layout.addWidget(hint)
+
+        grid = QtWidgets.QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(8)
+        self.four_channel_plots = []
+        self.four_channel_curves = []
+        self.four_channel_ac_curves = []
+        self.four_channel_info_labels = []
+        for channel, name in enumerate(FOUR_CHANNEL_NAMES):
+            box = QtWidgets.QGroupBox(name)
+            box_layout = QtWidgets.QVBoxLayout(box)
+            box_layout.setContentsMargins(7, 11, 7, 7)
+            info = QtWidgets.QLabel("等待数据")
+            info.setStyleSheet(f"font-weight:600;color:{FOUR_CHANNEL_COLORS[channel]};")
+            box_layout.addWidget(info)
+            plot = pg.PlotWidget()
+            plot.setDownsampling(auto=True, mode="peak")
+            plot.setLabel("bottom", "时间", units="s")
+            plot.setLabel("left", "归一化值")
+            plot.showGrid(x=True, y=True, alpha=0.25)
+            curve = plot.plot([], [], pen=pg.mkPen(FOUR_CHANNEL_COLORS[channel], width=1.35))
+            ac_curve = plot.plot([], [], pen=pg.mkPen("#f59e0b", width=1.0))
+            box_layout.addWidget(plot, 1)
+            grid.addWidget(box, channel // 2, channel % 2)
+            self.four_channel_plots.append(plot)
+            self.four_channel_curves.append(curve)
+            self.four_channel_ac_curves.append(ac_curve)
+            self.four_channel_info_labels.append(info)
+        grid.setRowStretch(0, 1)
+        grid.setRowStretch(1, 1)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        layout.addLayout(grid, 1)
+        return page
 
     def build_multi_page(self):
         page = QtWidgets.QWidget()
@@ -1287,17 +1470,31 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_sensor_mode_changed(self, _checked=False):
         if not self.ac_mode.isChecked() and not self.dc_mode.isChecked():
             return
-        is_dc = self.dc_mode.isChecked()
+        is_four_channel = self.is_four_channel_mode()
+        if is_four_channel and not self.ac_mode.isChecked():
+            self.ac_mode.setChecked(True)
+            return
+        is_dc = self.dc_mode.isChecked() and not is_four_channel
         if self.connect_button.isChecked():
             self.connect_button.setChecked(False)
             self.toggle_connection(False)
         is_multi = self.is_multi_mode()
         self.dc_controls.setVisible(is_dc and not is_multi)
         self.multi_dc_controls.setVisible(is_dc and is_multi)
-        self.data_format.setEnabled(not is_dc and not is_multi)
-        self.sample_rate.setEnabled(not is_dc and not is_multi)
+        self.dc_mode.setEnabled(not is_four_channel and not self.connect_button.isChecked())
+        self.data_format.setEnabled(not is_dc and not is_multi and not is_four_channel)
+        self.sample_rate.setEnabled(not is_dc and not is_multi and not is_four_channel)
+        if is_four_channel:
+            self.sample_rate.blockSignals(True)
+            self.sample_rate.setValue(FOUR_CHANNEL_DEFAULT_RATE)
+            self.sample_rate.blockSignals(False)
         self.show_ac_curve.setText("显示去直流波形" if not is_dc else "显示去均值波形")
-        self.baud_combo.setCurrentText("921600" if is_multi or not is_dc else "115200")
+        self.baud_combo.setCurrentText(
+            "2000000" if is_four_channel else ("921600" if is_multi or not is_dc else "115200")
+        )
+        self.realtime_stack.setCurrentIndex(1 if is_four_channel else 0)
+        self.four_channel_selector_label.setVisible(is_four_channel)
+        self.four_channel_selector.setVisible(is_four_channel)
         self.plot_tabs.setTabEnabled(1, is_dc)
         self.plot_tabs.setCurrentIndex(0)
         self.multi_plot_tabs.setTabEnabled(1, is_dc)
@@ -1309,10 +1506,10 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.clear_data()
         self.clear_multi_data(True)
-        topology = "一对多" if is_multi else "一对一"
+        topology = "一对多" if is_multi else ("四路 ADC" if is_four_channel else "一对一")
         self.status_left.setText(f"{'直流' if is_dc else '交流'}传感器 · {topology}模式")
         self.single_link_data_seen = False
-        mode_signature = (is_dc, is_multi)
+        mode_signature = (is_dc, is_multi, is_four_channel)
         if mode_signature != self.last_logged_mode:
             self.last_logged_mode = mode_signature
             self.log_event(
@@ -1320,20 +1517,26 @@ class MainWindow(QtWidgets.QMainWindow):
             )
 
     def on_topology_mode_changed(self, _checked=False):
-        if not self.single_mode.isChecked() and not self.multi_mode.isChecked():
+        if not self.single_mode.isChecked() and not self.multi_mode.isChecked() and not self.four_channel_mode.isChecked():
             return
         if self.connect_button.isChecked():
             self.connect_button.setChecked(False)
             self.toggle_connection(False)
         is_multi = self.is_multi_mode()
+        is_four_channel = self.is_four_channel_mode()
+        if is_four_channel:
+            self.ac_mode.setChecked(True)
         self.content_stack.setCurrentIndex(1 if is_multi else 0)
         self.baud_combo.setCurrentText(
-            "921600" if is_multi or self.ac_mode.isChecked() else "115200"
+            "2000000" if is_four_channel else ("921600" if is_multi or self.ac_mode.isChecked() else "115200")
         )
         self.on_sensor_mode_changed()
 
     def is_multi_mode(self):
         return hasattr(self, "multi_mode") and self.multi_mode.isChecked()
+
+    def is_four_channel_mode(self):
+        return hasattr(self, "four_channel_mode") and self.four_channel_mode.isChecked()
 
     @QtCore.pyqtSlot()
     def refresh_ports(self):
@@ -1389,7 +1592,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 try:
                     probe = serial.Serial(port, baud, timeout=0.02)
                     probe.reset_input_buffer()
-                    if self.is_multi_mode():
+                    if self.is_four_channel_mode():
+                        parser = FourChannelFrameParser()
+                    elif self.is_multi_mode():
                         parser = MultiFrameParser()
                     else:
                         parser = DcFrameParser() if self.dc_mode.isChecked() else FrameParser()
@@ -1413,7 +1618,9 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QApplication.restoreOverrideCursor()
             self.detect_baud_button.setEnabled(True)
         if found is None:
-            if self.is_multi_mode():
+            if self.is_four_channel_mode():
+                protocol = "四路 ADC 波形帧"
+            elif self.is_multi_mode():
                 protocol = "V2 多节点协议帧"
             else:
                 protocol = "直流协议帧" if self.dc_mode.isChecked() else "合法246字节帧"
@@ -1434,9 +1641,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.port_combo.setEnabled(not connected)
         self.baud_combo.setEnabled(not connected)
         self.ac_mode.setEnabled(not connected)
-        self.dc_mode.setEnabled(not connected)
+        self.dc_mode.setEnabled(not connected and not self.is_four_channel_mode())
         self.single_mode.setEnabled(not connected)
         self.multi_mode.setEnabled(not connected)
+        self.four_channel_mode.setEnabled(not connected)
         if not connected and self.is_multi_mode():
             self.multi_release_pending.clear()
             for node in (*self.multi_nodes.values(), *self.multi_archived_nodes.values()):
@@ -1456,6 +1664,9 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot(bytes)
     def on_bytes(self, chunk):
         self.total_bytes += len(chunk)
+        if self.is_four_channel_mode():
+            self.on_four_channel_bytes(chunk)
+            return
         if self.is_multi_mode():
             self.on_multi_bytes(chunk)
             return
@@ -1490,6 +1701,49 @@ class MainWindow(QtWidgets.QMainWindow):
             self.total_samples += SAMPLES_PER_FRAME
         self.trim_buffer()
         self.plot_dirty = True
+        self.update_status()
+
+    def on_four_channel_bytes(self, chunk):
+        discarded_before = self.four_channel_parser.discarded_bytes
+        outer_crc_before = self.four_channel_parser.outer_crc_errors
+        wave_errors_before = self.four_channel_parser.wave_errors
+        waves = self.four_channel_parser.feed(chunk)
+        discarded_delta = self.four_channel_parser.discarded_bytes - discarded_before
+        outer_crc_delta = self.four_channel_parser.outer_crc_errors - outer_crc_before
+        wave_error_delta = self.four_channel_parser.wave_errors - wave_errors_before
+        if discarded_delta:
+            self.log_event(
+                "警告", "problem", f"四路 ADC 串口同步丢弃 {discarded_delta} 字节", "四路 ADC 接收器"
+            )
+        if outer_crc_delta:
+            self.log_event(
+                "警告", "problem", f"四路 ADC 外层 CRC 错误 {outer_crc_delta} 帧", "四路 ADC 接收器"
+            )
+        if wave_error_delta:
+            self.log_event(
+                "警告", "problem", f"四路 ADC 波形校验错误 {wave_error_delta} 帧", "四路 ADC 接收器"
+            )
+        if waves and not self.single_link_data_seen:
+            self.single_link_data_seen = True
+            self.log_event(
+                "连接", "link", "收到首个合法四路 ADC 波形帧；推断蓝牙数据链路可用", "四路 ADC 接收器"
+            )
+        for wave in waves:
+            if self.four_last_sequence is not None:
+                delta = (wave.sequence - self.four_last_sequence) & 0xFFFF
+                if 1 < delta < 0x8000:
+                    self.four_missing_frames += delta - 1
+            self.four_last_sequence = wave.sequence
+            self.four_channel_rate = wave.sample_rate
+            if self.four_start_scan is None:
+                self.four_start_scan = wave.first_scan
+            for index, (channel, value, gain_code) in enumerate(wave.samples):
+                scan = wave.first_scan + index // FOUR_CHANNEL_COUNT
+                self.four_channel_rows[channel].append((scan, value, gain_code))
+            self.total_samples += len(wave.samples)
+        if waves:
+            self.trim_buffer()
+            self.four_plot_dirty = True
         self.update_status()
 
     def on_dc_bytes(self, chunk):
@@ -2508,6 +2762,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.is_multi_mode():
             self.trim_multi_buffers()
             return
+        if self.is_four_channel_mode():
+            self.trim_four_channel_buffers()
+            return
         if self.hold_data.isChecked() or self.show_all_data():
             return
         if self.dc_mode.isChecked():
@@ -2521,15 +2778,88 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sample_count -= len(removed)
 
     def get_data(self):
+        if self.is_four_channel_mode():
+            channel = self.four_channel_selector.currentIndex()
+            return np.asarray([row[1] for row in self.four_channel_rows[channel]], dtype=np.float64)
         if self.dc_mode.isChecked():
             return np.asarray([row[3] for row in self.dc_rows], dtype=np.float64)
         if not self.sample_chunks:
             return np.empty(0)
         return np.concatenate(tuple(self.sample_chunks))
 
+    def trim_four_channel_buffers(self):
+        if self.hold_data.isChecked() or self.show_all_data():
+            return
+        span = max(1, int(self.duration_seconds() * self.four_channel_rate))
+        for rows in self.four_channel_rows:
+            if not rows:
+                continue
+            cutoff = max(0, rows[-1][0] - span + 1)
+            while rows and rows[0][0] < cutoff:
+                rows.popleft()
+
+    def four_visible_rows(self, rows):
+        if not rows:
+            return ()
+        if self.show_all_data():
+            return tuple(rows)
+        span = max(1, int(self.duration_seconds() * self.four_channel_rate))
+        cutoff = max(0, rows[-1][0] - span + 1)
+        return tuple(row for row in rows if row[0] >= cutoff)
+
+    def refresh_four_channel_plot(self):
+        if not self.four_plot_dirty or self.paused:
+            return
+        time_scale, time_unit, _decimals = self.time_display_settings()
+        selected_channel = self.four_channel_selector.currentIndex()
+        selected_x = selected_y = np.empty(0)
+        for channel, rows in enumerate(self.four_channel_rows):
+            visible_rows = self.four_visible_rows(rows)
+            plot = self.four_channel_plots[channel]
+            curve = self.four_channel_curves[channel]
+            ac_curve = self.four_channel_ac_curves[channel]
+            info = self.four_channel_info_labels[channel]
+            plot.setLabel("bottom", "时间", units=time_unit)
+            if not visible_rows:
+                curve.setData([], [])
+                ac_curve.setData([], [])
+                info.setText("等待数据")
+                continue
+            scans = np.asarray([row[0] for row in visible_rows], dtype=np.float64)
+            values = np.asarray([row[1] for row in visible_rows], dtype=np.float64)
+            gains = [row[2] for row in visible_rows]
+            start_scan = self.four_start_scan if self.four_start_scan is not None else scans[0]
+            x = (scans - start_scan) / self.four_channel_rate * time_scale
+            curve.setData(x, values, skipFiniteCheck=True)
+            curve.setVisible(self.show_sensor_curve.isChecked())
+            if self.show_ac_curve.isChecked():
+                ac_curve.setData(x, values - np.mean(values), skipFiniteCheck=True)
+                ac_curve.show()
+            else:
+                ac_curve.hide()
+            plot.setXRange(
+                float(x[0]), float(x[-1]) if x.size > 1 else float(x[0] + time_scale / self.four_channel_rate),
+                padding=0,
+            )
+            if self.auto_y.isChecked():
+                plot.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
+            current_gain = 1 << gains[-1]
+            info.setText(
+                f"当前 {int(values[-1])} · 增益 ×{current_gain} · 均值 {np.mean(values):.1f} · "
+                f"峰峰值 {int(np.ptp(values))} · 样点 {values.size}"
+            )
+            if channel == selected_channel:
+                selected_x, selected_y = x, values
+        self.last_x, self.last_y = selected_x, selected_y
+        self.update_stats(selected_y, f"{FOUR_CHANNEL_NAMES[selected_channel]} 当前窗口")
+        self.four_plot_dirty = False
+
     def refresh_plot(self):
         if self.is_multi_mode():
             self.refresh_multi_plot()
+            return
+        if self.is_four_channel_mode():
+            self.refresh_four_channel_plot()
             return
         if not self.plot_dirty or self.paused:
             return
@@ -2705,11 +3035,21 @@ class MainWindow(QtWidgets.QMainWindow):
             item.show()
 
     def on_auto_y(self, checked):
+        if self.is_four_channel_mode():
+            for plot in self.four_channel_plots:
+                plot.enableAutoRange(axis=pg.ViewBox.YAxis, enable=checked)
+                if checked:
+                    plot.autoRange()
+            return
         self.plot.enableAutoRange(axis=pg.ViewBox.YAxis, enable=checked)
         if checked:
             self.plot.autoRange()
 
     def reset_view(self):
+        if self.is_four_channel_mode():
+            for plot in self.four_channel_plots:
+                plot.autoRange()
+            return
         self.plot.autoRange()
         if self.last_x.size:
             self.plot.setXRange(float(self.last_x[0]), float(self.last_x[-1]), padding=0)
@@ -2717,6 +3057,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_duration_changed(self):
         _scale, unit, _decimals = self.time_display_settings()
         self.plot.setLabel("bottom", "时间", units=unit)
+        for plot in getattr(self, "four_channel_plots", ()):
+            plot.setLabel("bottom", "时间", units=unit)
         if self.show_all_data():
             self.mark_dirty()
             return
@@ -2773,17 +3115,27 @@ class MainWindow(QtWidgets.QMainWindow):
     def mark_dirty(self):
         if self.is_multi_mode():
             self.multi_plot_dirty = True
+        elif self.is_four_channel_mode():
+            self.four_plot_dirty = True
         else:
             self.plot_dirty = True
 
     def clear_data(self):
         self.parser.clear()
         self.dc_parser.clear()
+        self.four_channel_parser.clear()
         self.sample_chunks.clear()
         self.dc_rows.clear()
         self.dc_scan_points.clear()
+        for rows in self.four_channel_rows:
+            rows.clear()
         self.dc_start_time = None
         self.sample_count = 0
+        self.four_channel_rate = FOUR_CHANNEL_DEFAULT_RATE
+        self.four_last_sequence = None
+        self.four_start_scan = None
+        self.four_missing_frames = 0
+        self.four_plot_dirty = False
         self.total_samples = 0
         self.total_bytes = 0
         self.zero_frames = 0
@@ -2792,6 +3144,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.last_y = np.empty(0)
         self.curve.setData([], [])
         self.ac_curve.setData([], [])
+        for curve, ac_curve, info in zip(
+                self.four_channel_curves, self.four_channel_ac_curves, self.four_channel_info_labels):
+            curve.setData([], [])
+            ac_curve.setData([], [])
+            info.setText("等待数据")
         self.dc_scan_curve.setData([], [])
         self.clear_dc_scan_selection()
         self.dc_scan_info.setText("等待扫描；点击数据点可查看坐标")
@@ -2802,6 +3159,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.update_status()
 
     def save_data(self):
+        if self.is_four_channel_mode():
+            self.save_four_channel_data()
+            return
         data = self.get_data()
         if data.size == 0:
             self.show_error("当前没有可保存的数据。")
@@ -2833,6 +3193,38 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             self.show_error(f"保存失败：{exc}")
 
+    def save_four_channel_data(self):
+        rows = []
+        for channel, channel_rows in enumerate(self.four_channel_rows):
+            rows.extend((scan, channel, value, gain_code) for scan, value, gain_code in channel_rows)
+        if not rows:
+            self.show_error("当前没有可保存的四路 ADC 数据。")
+            return
+        rows.sort(key=lambda row: (row[0], row[1]))
+        default = f"four_channel_adc_{datetime.now():%Y%m%d_%H%M%S}.csv"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "保存四路 ADC 数据", str(Path.home() / default), "CSV 文件 (*.csv)"
+        )
+        if not path:
+            return
+        first_scan = rows[0][0]
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+                writer = csv.writer(handle)
+                writer.writerow([
+                    "channel", "amplifier", "sample_index", "time_s",
+                    "normalized_value", "gain_code", "gain",
+                ])
+                for scan, channel, value, gain_code in rows:
+                    writer.writerow([
+                        channel + 1, f"U{channel + 4}", scan,
+                        f"{(scan - first_scan) / self.four_channel_rate:.9f}",
+                        value, gain_code, 1 << gain_code,
+                    ])
+            self.statusBar().showMessage(f"四路 ADC 数据已保存：{path}", 6000)
+        except Exception as exc:
+            self.show_error(f"保存失败：{exc}")
+
     def update_status(self):
         if self.is_multi_mode():
             online = sum(1 for node in self.multi_nodes.values() if node.online)
@@ -2850,6 +3242,16 @@ class MainWindow(QtWidgets.QMainWindow):
                     f" | 中继链路 {links} | BLE队列 {ble_depth} | PC空闲槽 {pc_free} | 去重 {duplicates}"
                 )
             self.status_right.setText(text)
+            return
+        if self.is_four_channel_mode():
+            points = "/".join(str(len(rows)) for rows in self.four_channel_rows)
+            self.status_right.setStyleSheet("")
+            self.status_right.setText(
+                f"四路有效帧 {self.four_channel_parser.valid_frames} | 缺帧 {self.four_missing_frames} | "
+                f"每路 {self.four_channel_rate} S/s | 接收 {self.total_bytes:,} B | "
+                f"CH1/2/3/4 样点 {points} | 外层 CRC {self.four_channel_parser.outer_crc_errors} | "
+                f"波形错误 {self.four_channel_parser.wave_errors} | 丢弃 {self.four_channel_parser.discarded_bytes:,} B"
+            )
             return
         if self.dc_mode.isChecked():
             self.status_right.setStyleSheet("")
